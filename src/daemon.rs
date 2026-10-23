@@ -37,7 +37,7 @@ impl Daemon {
         let spec = hotkey::Spec::parse(&cfg.hotkey)?;
         let (tx, hk) = channel();
         hotkey::spawn(spec, tx, true)?;
-        let capture = crate::audio::spawn_capture()?;
+        let capture = crate::audio::spawn_capture(cfg.input_device.clone())?;
         Ok(Self {
             cfg,
             published: String::new(),

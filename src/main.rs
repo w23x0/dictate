@@ -58,6 +58,13 @@ fn run() -> Result<()> {
         "transcribe" => cmd_transcribe(&args[1..]),
         "record" => cmd_record(&args[1..]),
         "doctor" => cmd_doctor(),
+        "devices" => {
+            for line in audio::input_names() {
+                println!("{line}");
+            }
+            println!("（* = 默认输入设备）");
+            Ok(())
+        }
         "history" => tui::run(History::new(config::history_path())),
         "run" => {
             // 终端视图 + 托盘同时存在：热键/录音在守护进程里，这里只是附着
@@ -104,6 +111,7 @@ fn help() -> Result<()> {
          dictate settings                            终端里改配置（不用手写 TOML）\n  \
          dictate                                     托盘常驻（无终端）\n  \
          dictate doctor                              不发录音，验 key / 模型 / 区域\n  \
+         dictate devices                             列出输入设备（* = 默认）\n  \
          dictate run                                  热键守护 + 终端历史（常驻）\n  \
          dictate history                              只看历史\n\n\
          配置：{}\n\
@@ -165,9 +173,17 @@ fn cmd_probe(args: &[String]) -> Result<()> {
         .unwrap_or(5.0);
     let out = flag(args, "--out").map(PathBuf::from);
 
+    let cfg = config::load()?;
+    println!(
+        "设备：{}",
+        cfg.input_device
+            .clone()
+            .or_else(audio::default_input_name)
+            .unwrap_or_else(|| "（未知）".into())
+    );
     println!("录音 {seconds} 秒…");
-    let (rate, raw) = audio::record_seconds(seconds)?;
-    println!("设备采样率 {rate} Hz，{} 个样本", raw.len());
+    let (rate, raw) = audio::record_seconds(seconds, cfg.input_device.as_deref().or(None))?;
+    println!("采样率 {rate} Hz，{} 个样本", raw.len());
 
     let mut pcm = Vec::new();
     let mut ds = Downsampler::new(rate)?;
@@ -175,6 +191,11 @@ fn cmd_probe(args: &[String]) -> Result<()> {
     ds.finish(&mut pcm)?;
 
     let before = lin_to_db(rms(&pcm));
+    let peak_in = lin_to_db(pcm.iter().fold(0.0f32, |m, s| m.max(s.abs())));
+    if peak_in < -70.0 {
+        println!("⚠ 这个设备没有任何信号（峰值 {peak_in:.0} dBFS）——通常是环回设备或麦克风被静音。");
+        println!("  `dictate devices` 看有哪些输入；`pactl info | grep 'Default Source'` 看系统默认源。");
+    }
     let trimmed = vad::trim_silence(&pcm, audio::TARGET_RATE, 100);
     let mut voiced = trimmed.to_vec();
     let mut agc = Agc::new(
@@ -188,7 +209,7 @@ fn cmd_probe(args: &[String]) -> Result<()> {
     let after = lin_to_db(rms(&voiced));
 
     println!(
-        "16 kHz 后：{} 样本（{:.2} s），原始 {before:.1} dBFS，语音段 {} 样本，AGC 后 {after:.1} dBFS（增益 ×{gain:.2}）",
+        "16 kHz 后：{} 样本（{:.2} s），RMS {before:.1} / 峰值 {peak_in:.1} dBFS，语音段 {} 样本，AGC 后 {after:.1} dBFS（增益 ×{gain:.2}）",
         pcm.len(),
         pcm.len() as f32 / audio::TARGET_RATE as f32,
         voiced.len()
@@ -224,7 +245,7 @@ fn cmd_record(args: &[String]) -> Result<()> {
         "录音中…（最长 {max:.0} 秒，静音 {:.1} 秒自动结束）",
         cfg.silence_stop_ms as f32 / 1000.0
     );
-    let (rate, raw) = audio::record_until(max, cfg.silence_stop_ms)?;
+    let (rate, raw) = audio::record_until(max, cfg.silence_stop_ms, cfg.input_device.as_deref())?;
     let secs = raw.len() as f32 / rate as f32;
     let wav = pipeline::prepare_wav(&cfg, &raw, rate)?;
     let hist = History::new(config::history_path());

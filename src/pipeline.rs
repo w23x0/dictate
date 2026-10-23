@@ -16,9 +16,23 @@ pub fn prepare_wav(cfg: &Config, pcm: &[f32], rate: u32) -> Result<Vec<u8>> {
     ds.push(pcm, &mut mono)?;
     ds.finish(&mut mono)?;
 
-    let trimmed = crate::vad::trim_silence(&mono, audio::TARGET_RATE, 100).to_vec();
+    // 先 AGC 再裁静音：反过来的话，说得很轻的真话会被当成静音整段丢掉。
+    let mut processed = mono;
+    let mut agc = Agc::new(
+        audio::TARGET_RATE,
+        AgcConfig { target_dbfs: cfg.target_rms_dbfs, ..Default::default() },
+    );
+    agc.process(&mut processed);
+
+    let peak = crate::agc::lin_to_db(
+        processed.iter().fold(0.0f32, |m, s| m.max(s.abs())),
+    );
+    let trimmed = crate::vad::trim_silence(&processed, audio::TARGET_RATE, 100).to_vec();
     if trimmed.is_empty() {
-        bail!("这段里没有检测到语音（全在 {} dBFS 以下）", crate::vad::SPEECH_DBFS);
+        bail!(
+            "没有检测到语音：峰值 {peak:.0} dBFS，低于门限 {:.0} dBFS。             检查麦克风（`dictate probe --seconds 3` 看电平，或用 `dictate devices` 换设备）",
+            crate::vad::SPEECH_DBFS
+        );
     }
     let secs = trimmed.len() as f32 / audio::TARGET_RATE as f32;
     if secs > cfg.max_seconds {
@@ -27,12 +41,7 @@ pub fn prepare_wav(cfg: &Config, pcm: &[f32], rate: u32) -> Result<Vec<u8>> {
             cfg.max_seconds
         );
     }
-    let mut voiced = trimmed;
-    let mut agc = Agc::new(
-        audio::TARGET_RATE,
-        AgcConfig { target_dbfs: cfg.target_rms_dbfs, ..Default::default() },
-    );
-    agc.process(&mut voiced);
+    let voiced = trimmed;
 
     let path = std::env::temp_dir().join(format!("dictate-{}.wav", new_id()));
     audio::write_wav(&path, &voiced)?;

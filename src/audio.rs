@@ -70,15 +70,78 @@ impl Downsampler {
     }
 }
 
-/// 录一段固定时长，返回（设备采样率，单声道 f32）。
-pub fn record_seconds(seconds: f32) -> Result<(u32, Vec<f32>)> {
-    use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+/// 在闭包执行期间把 fd 2 指向 /dev/null——绕过 ALSA→JACK 插件往 stderr 喷的噪声。
+#[cfg(unix)]
+pub fn quiet<R>(f: impl FnOnce() -> R) -> R {
+    use std::os::unix::io::AsRawFd;
+    let devnull = std::fs::OpenOptions::new().write(true).open("/dev/null").ok();
+    let saved = unsafe { libc::dup(2) };
+    if let Some(d) = &devnull {
+        unsafe { libc::dup2(d.as_raw_fd(), 2) };
+    }
+    let r = f();
+    if saved >= 0 {
+        unsafe { libc::dup2(saved, 2) };
+        unsafe { libc::close(saved) };
+    }
+    r
+}
 
+#[cfg(not(unix))]
+pub fn quiet<R>(f: impl FnOnce() -> R) -> R {
+    f()
+}
+
+/// 按名字找输入设备；名字为空就用系统默认。
+pub fn open_input(name: Option<&str>) -> anyhow::Result<cpal::Device> {
+    use cpal::traits::{DeviceTrait, HostTrait};
     let host = cpal::default_host();
-    let device = host
+    let Some(want) = name.filter(|n| !n.trim().is_empty()) else {
+        return host
+            .default_input_device()
+            .ok_or_else(|| anyhow!("没有可用的输入设备"));
+    };
+    host.input_devices()?
+        .find(|d| d.name().map(|n| n == want).unwrap_or(false))
+        .ok_or_else(|| anyhow!("找不到输入设备「{want}」（用 `dictate devices` 看列表）"))
+}
+
+/// 列出所有输入设备名，默认设备加 `*`。
+pub fn input_names() -> Vec<String> {
+    quiet(input_names_inner)
+}
+
+fn input_names_inner() -> Vec<String> {
+    use cpal::traits::{DeviceTrait, HostTrait};
+    let host = cpal::default_host();
+    let default = host
         .default_input_device()
-        .ok_or_else(|| anyhow!("没有可用的输入设备"))?;
-    let supported = device.default_input_config().context("读默认输入配置失败")?;
+        .and_then(|d| d.name().ok())
+        .unwrap_or_default();
+    host.input_devices()
+        .map(|it| {
+            it.filter_map(|d| d.name().ok())
+                .map(|n| if n == default { format!("* {n}") } else { format!("  {n}") })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+pub fn default_input_name() -> Option<String> {
+    use cpal::traits::{DeviceTrait, HostTrait};
+    quiet(|| {
+        cpal::default_host()
+            .default_input_device()
+            .and_then(|d| d.name().ok())
+    })
+}
+
+/// 录一段固定时长，返回（设备采样率，单声道 f32）。
+pub fn record_seconds(seconds: f32, device_name: Option<&str>) -> Result<(u32, Vec<f32>)> {
+    use cpal::traits::{DeviceTrait, StreamTrait};
+
+    let device = quiet(|| open_input(device_name))?;
+    let supported = quiet(|| device.default_input_config()).context("读默认输入配置失败")?;
     let rate = supported.sample_rate().0;
     let channels = supported.channels() as usize;
     let format = supported.sample_format();
@@ -125,14 +188,11 @@ pub fn record_seconds(seconds: f32) -> Result<(u32, Vec<f32>)> {
 /// 录到「最长 `max_seconds`」或「说完后静音 `silence_ms`」为止。
 ///
 /// 只在已经出现过语音之后才计静音，否则一开口前就被自己的静音判停。
-pub fn record_until(max_seconds: f32, silence_ms: u32) -> Result<(u32, Vec<f32>)> {
-    use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+pub fn record_until(max_seconds: f32, silence_ms: u32, device_name: Option<&str>) -> Result<(u32, Vec<f32>)> {
+    use cpal::traits::{DeviceTrait, StreamTrait};
 
-    let host = cpal::default_host();
-    let device = host
-        .default_input_device()
-        .ok_or_else(|| anyhow!("没有可用的输入设备"))?;
-    let supported = device.default_input_config().context("读默认输入配置失败")?;
+    let device = quiet(|| open_input(device_name))?;
+    let supported = quiet(|| device.default_input_config()).context("读默认输入配置失败")?;
     let rate = supported.sample_rate().0;
     let channels = supported.channels() as usize;
     let format = supported.sample_format();
@@ -316,23 +376,22 @@ impl Drop for Capture {
 }
 
 /// 起一个常驻采集线程。cpal 的 `Stream` 不是 `Send`，所以流必须待在这条线程里。
-pub fn spawn_capture() -> anyhow::Result<Capture> {
+pub fn spawn_capture(device_name: Option<String>) -> anyhow::Result<Capture> {
     let (cmd_tx, cmd_rx) = std::sync::mpsc::channel::<CaptureCmd>();
     let (res_tx, res_rx) = std::sync::mpsc::channel::<(u32, Vec<f32>)>();
 
     std::thread::spawn(move || {
-        use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+        use cpal::traits::{DeviceTrait, StreamTrait};
         while let Ok(cmd) = cmd_rx.recv() {
             match cmd {
                 CaptureCmd::Quit => return,
                 CaptureCmd::Stop => {}
                 CaptureCmd::Start { max_seconds } => {
-                    let host = cpal::default_host();
-                    let Some(device) = host.default_input_device() else {
-                        eprintln!("[audio] 没有输入设备");
+                    let Ok(device) = quiet(|| open_input(device_name.as_deref())) else {
+                        eprintln!("[audio] 打不开输入设备");
                         continue;
                     };
-                    let Ok(supported) = device.default_input_config() else {
+                    let Ok(supported) = quiet(|| device.default_input_config()) else {
                         eprintln!("[audio] 读默认输入配置失败");
                         continue;
                     };

@@ -37,6 +37,8 @@ pub struct Config {
     pub theme: Option<String>,
     /// 颜色开关：`auto`（默认，尊重 NO_COLOR）/ `always`（强制彩色）/ `never`。
     pub color: Option<String>,
+    /// 输入设备名（留空 = 系统默认）。`dictate devices` 可以列出来。
+    pub input_device: Option<String>,
 }
 
 impl Default for Config {
@@ -56,6 +58,7 @@ impl Default for Config {
             api_style: None,
             theme: None,
             color: None,
+            input_device: None,
         }
     }
 }
