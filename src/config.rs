@@ -84,6 +84,24 @@ pub fn history_path() -> PathBuf {
         .join("history.jsonl")
 }
 
+/// 写回配置文件；unix 上顺手把权限压到 0600（里面有 key）。
+pub fn write(path: &std::path::Path, cfg: &Config) -> Result<()> {
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).ok();
+    }
+    let body = format!(
+        "# dictate 配置（由 `dictate settings` 写入；手改也认）\n\n{}",
+        toml::to_string_pretty(cfg)?
+    );
+    std::fs::write(path, body)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+    }
+    Ok(())
+}
+
 pub fn load() -> Result<Config> {
     let path = config_path();
     if !path.exists() {

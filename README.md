@@ -15,13 +15,18 @@
 | 历史（`history.jsonl`，容错读） | ✅ 单测 + TUI 实测 |
 | 终端历史窗口（ratatui，复制/搜索/删除/清空） | ✅ pty 实测（OSC52 复制内容逐字节核对） |
 | 全局热键（Linux evdev / Windows LL hook） | ✅ Linux 真机监听；Windows 只做了 `cargo check` |
+| 托盘常驻 / 无终端运行 | ✅ Linux 真机（GNOME + appindicator 扩展），托盘项已注册 |
+| 应用搜索（.desktop + 图标） | ✅ 首次运行自动写 `~/.local/share/applications/dictate.desktop` |
+| 终端内配置界面 | ✅ `dictate settings` |
 | 实时 WS 转写 | ⬜ 未做 |
 
 ## 用法
 
 ```bash
+dictate                 # 托盘常驻：无终端也能用（关掉终端不影响）
+dictate settings        # 终端里改配置（不用手写 TOML）
+dictate run             # 终端版：热键 + 历史列表常驻
 cargo run --release -- doctor                               # 不发录音，验 key / 区域 / 模型
-cargo run --release -- run                                  # 热键守护 + 历史（常驻）
 cargo run --release -- probe --seconds 3 --out /tmp/a.wav   # 验采集：打印电平、可落盘
 cargo run --release -- record                               # 录到静音自动结束，直接转写
 cargo run --release -- transcribe /tmp/a.wav                # 转写现成 WAV
@@ -56,6 +61,19 @@ cargo run --release -- history                              # 终端历史窗口
 带 `/compatible-mode/v1` 之类的尾巴会自动剥掉。
 
 三种形状都有本地假服务端的端到端测试（真 socket），见 `src/asr/e2e.rs`。
+
+## 托盘 / 无终端
+
+```bash
+dictate            # 常驻，托盘图标出现，热键全局可用
+```
+
+- 托盘菜单：**打开历史…** / **设置…** / **退出**（前两个会在终端模拟器里开对应的 TUI）
+- 能出现在应用搜索里：首次运行写 `~/.local/share/applications/dictate.desktop` + 图标
+- 单实例：重复启动会直接提示「已经在跑了」并退出
+- **GNOME 需要 AppIndicator 扩展**才有托盘图标（Ubuntu 自带，但默认可能没启用）：
+  `gnome-extensions enable ubuntu-appindicators@ubuntu.com`
+- 托盘在 Linux 用 libayatana-appindicator（会有 deprecation 警告，正常）；Windows 用 tray-icon
 
 ## 配置
 

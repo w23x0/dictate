@@ -42,6 +42,24 @@ pub fn prepare_wav(cfg: &Config, pcm: &[f32], rate: u32) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
+/// 不录音也能验通路：发一段 1 秒正弦，返回（耗时 ms，文本）。
+pub fn self_test(cfg: &Config) -> Result<(u64, String)> {
+    let samples: Vec<f32> = (0..audio::TARGET_RATE)
+        .map(|i| {
+            0.1 * (2.0 * std::f32::consts::PI * 440.0 * i as f32
+                / audio::TARGET_RATE as f32)
+                .sin()
+        })
+        .collect();
+    let path = std::env::temp_dir().join(format!("dictate-selftest-{}.wav", new_id()));
+    audio::write_wav(&path, &samples)?;
+    let wav = std::fs::read(&path)?;
+    std::fs::remove_file(&path).ok();
+    let client = crate::asr::QwenClient::from_config(cfg)?;
+    let t = client.transcribe_wav(&wav)?;
+    Ok((t.latency_ms, t.text))
+}
+
 /// 转写并把结果写进历史；失败也写一条（带错误原因），返回值仍然是错误。
 pub fn transcribe_and_record(
     cfg: &Config,

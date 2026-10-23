@@ -10,9 +10,14 @@ mod agc;
 mod asr;
 mod audio;
 mod config;
+mod daemon;
+mod desktop;
 mod history;
 mod hotkey;
+mod icon;
 mod pipeline;
+mod settings_ui;
+mod tray;
 mod tui;
 mod vad;
 
@@ -34,9 +39,12 @@ fn main() {
 fn run() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let Some(cmd) = args.first() else {
-        return help();
+        // 无参数 = 托盘常驻（关掉终端也能用）
+        return run_tray();
     };
     match cmd.as_str() {
+        "settings" => settings_ui::run(),
+        "tray" => run_tray(),
         "probe" => cmd_probe(&args[1..]),
         "transcribe" => cmd_transcribe(&args[1..]),
         "record" => cmd_record(&args[1..]),
@@ -54,6 +62,18 @@ fn run() -> Result<()> {
     }
 }
 
+fn run_tray() -> Result<()> {
+    let _lock = match desktop::acquire_single_instance() {
+        Some(l) => l,
+        None => {
+            println!("dictate 已经在跑了（托盘里找一下）。要改设置：dictate settings");
+            return Ok(());
+        }
+    };
+    let cfg = config::load()?;
+    tray::run(cfg)
+}
+
 fn help() -> Result<()> {
     println!(
         "dictate — Qwen ASR 听写器\n\n\
@@ -61,6 +81,8 @@ fn help() -> Result<()> {
          dictate probe [--seconds 5] [--out out.wav]   录一段，打印电平，可落盘\n  \
          dictate transcribe <file.wav>                转写 WAV 并写入历史\n  \
          dictate record [--seconds 5]                 录一段并转写\n  \
+         dictate settings                            终端里改配置（不用手写 TOML）\n  \
+         dictate                                     托盘常驻（无终端）\n  \
          dictate doctor                              不发录音，验 key / 模型 / 区域\n  \
          dictate run                                  热键守护 + 终端历史（常驻）\n  \
          dictate history                              只看历史\n\n\
@@ -76,9 +98,17 @@ fn help() -> Result<()> {
 fn cmd_doctor() -> Result<()> {
     let cfg = config::load()?;
     println!("配置：{}", config::config_path().display());
-    println!("端点：{}", cfg.endpoint());
+    let style = asr::pick_style(&cfg.model, cfg.api_style.as_deref()).ok();
+    let probe = asr::QwenClient::from_config(&cfg).ok();
+    println!(
+        "端点：{}",
+        match (&probe, style) {
+            (Some(c), Some(asr::Style::Ws)) => c.ws_url().unwrap_or_default(),
+            _ => cfg.endpoint(),
+        }
+    );
     println!("模型：{}", cfg.model);
-    if let Ok(style) = asr::pick_style(&cfg.model, cfg.api_style.as_deref()) {
+    if let Some(style) = style {
         println!("报文形状：{}", style.name());
     }
     println!(
@@ -88,21 +118,11 @@ fn cmd_doctor() -> Result<()> {
             None => "缺失（DASHSCOPE_API_KEY 或配置文件 api_key）",
         }
     );
-    let client = asr::QwenClient::from_config(&cfg)?;
-
-    let samples: Vec<f32> = (0..audio::TARGET_RATE)
-        .map(|i| 0.1 * (2.0 * std::f32::consts::PI * 440.0 * i as f32 / audio::TARGET_RATE as f32).sin())
-        .collect();
-    let path = std::env::temp_dir().join(format!("dictate-doctor-{}.wav", std::process::id()));
-    audio::write_wav(&path, &samples)?;
-    let wav = std::fs::read(&path)?;
-    std::fs::remove_file(&path).ok();
-
     print!("发一段 1 秒测试音… ");
-    match client.transcribe_wav(&wav) {
-        Ok(t) => {
-            println!("OK（{} ms）", t.latency_ms);
-            println!("返回文本：{:?}", t.text);
+    match pipeline::self_test(&cfg) {
+        Ok((ms, text)) => {
+            println!("OK（{ms} ms）");
+            println!("返回文本：{text:?}");
             println!("说明：这段是正弦音，转写内容无意义，能返回就说明 key / 区域 / 模型都对。");
             Ok(())
         }
