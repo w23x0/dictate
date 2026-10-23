@@ -275,3 +275,133 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 }
+
+// ───────────────────────── 热键守护用的可停采集 ─────────────────────────
+
+/// 采集线程的命令。`Start` 带最长时长，到点由采集线程自己停。
+pub enum CaptureCmd {
+    Start { max_seconds: f32 },
+    Stop,
+    Quit,
+}
+
+/// 一条采集会话的句柄：`start` 之后 `stop` 拿样本。
+pub struct Capture {
+    cmd: std::sync::mpsc::Sender<CaptureCmd>,
+    result: std::sync::mpsc::Receiver<(u32, Vec<f32>)>,
+}
+
+impl Capture {
+    pub fn start(&self, max_seconds: f32) -> anyhow::Result<()> {
+        self.cmd
+            .send(CaptureCmd::Start { max_seconds })
+            .map_err(|_| anyhow!("采集线程已退出"))?;
+        Ok(())
+    }
+
+    pub fn stop(&self) -> anyhow::Result<(u32, Vec<f32>)> {
+        self.cmd
+            .send(CaptureCmd::Stop)
+            .map_err(|_| anyhow!("采集线程已退出"))?;
+        self.result
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .map_err(|_| anyhow!("采集线程没有在 5 秒内交回样本"))
+    }
+}
+
+impl Drop for Capture {
+    fn drop(&mut self) {
+        let _ = self.cmd.send(CaptureCmd::Quit);
+    }
+}
+
+/// 起一个常驻采集线程。cpal 的 `Stream` 不是 `Send`，所以流必须待在这条线程里。
+pub fn spawn_capture() -> anyhow::Result<Capture> {
+    let (cmd_tx, cmd_rx) = std::sync::mpsc::channel::<CaptureCmd>();
+    let (res_tx, res_rx) = std::sync::mpsc::channel::<(u32, Vec<f32>)>();
+
+    std::thread::spawn(move || {
+        use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+        while let Ok(cmd) = cmd_rx.recv() {
+            match cmd {
+                CaptureCmd::Quit => return,
+                CaptureCmd::Stop => {}
+                CaptureCmd::Start { max_seconds } => {
+                    let host = cpal::default_host();
+                    let Some(device) = host.default_input_device() else {
+                        eprintln!("[audio] 没有输入设备");
+                        continue;
+                    };
+                    let Ok(supported) = device.default_input_config() else {
+                        eprintln!("[audio] 读默认输入配置失败");
+                        continue;
+                    };
+                    let rate = supported.sample_rate().0;
+                    let channels = supported.channels() as usize;
+                    let format = supported.sample_format();
+                    let config: cpal::StreamConfig = supported.into();
+                    let buf: Arc<Mutex<Vec<f32>>> = Arc::new(Mutex::new(Vec::new()));
+                    let sink = Arc::clone(&buf);
+                    let err_fn = |e| eprintln!("[audio] 采集流错误：{e}");
+
+                    let stream = match format {
+                        cpal::SampleFormat::F32 => device.build_input_stream(
+                            &config,
+                            move |data: &[f32], _: &cpal::InputCallbackInfo| {
+                                let mono = to_mono(data, channels);
+                                sink.lock().unwrap().extend_from_slice(&mono);
+                            },
+                            err_fn,
+                            None,
+                        ),
+                        cpal::SampleFormat::I16 => device.build_input_stream(
+                            &config,
+                            move |data: &[i16], _: &cpal::InputCallbackInfo| {
+                                let f: Vec<f32> = data.iter().map(|s| *s as f32 / 32768.0).collect();
+                                let mono = to_mono(&f, channels);
+                                sink.lock().unwrap().extend_from_slice(&mono);
+                            },
+                            err_fn,
+                            None,
+                        ),
+                        other => {
+                            eprintln!("[audio] 不支持的采样格式：{other:?}");
+                            continue;
+                        }
+                    };
+                    let Ok(stream) = stream else {
+                        eprintln!("[audio] 建采集流失败");
+                        continue;
+                    };
+                    if stream.play().is_err() {
+                        eprintln!("[audio] 启动采集失败");
+                        continue;
+                    }
+                    let started = std::time::Instant::now();
+                    loop {
+                        std::thread::sleep(std::time::Duration::from_millis(15));
+                        match cmd_rx.try_recv() {
+                            Ok(CaptureCmd::Stop) => break,
+                            Ok(CaptureCmd::Quit) => return,
+                            Ok(CaptureCmd::Start { .. }) => {}
+                            Err(std::sync::mpsc::TryRecvError::Disconnected) => return,
+                            Err(_) => {}
+                        }
+                        if started.elapsed().as_secs_f32() >= max_seconds {
+                            break;
+                        }
+                    }
+                    drop(stream);
+                    let data = Arc::try_unwrap(buf)
+                        .map(|m| m.into_inner().unwrap())
+                        .unwrap_or_default();
+                    if res_tx.send((rate, data)).is_err() {
+                        return;
+                    }
+                }
+            }
+        }
+    });
+
+    Ok(Capture { cmd: cmd_tx, result: res_rx })
+}

@@ -14,12 +14,14 @@
 | Qwen ASR（OpenAI 兼容 `chat/completions` + base64） | ✅ 真跑（mock 服务端收到正确报文） |
 | 历史（`history.jsonl`，容错读） | ✅ 单测 + TUI 实测 |
 | 终端历史窗口（ratatui，复制/搜索/删除/清空） | ✅ pty 实测（OSC52 复制内容逐字节核对） |
-| 全局热键 + 托盘 | ⬜ 未做（下一步） |
+| 全局热键（Linux evdev / Windows LL hook） | ✅ Linux 真机监听；Windows 只做了 `cargo check` |
 | 实时 WS 转写 | ⬜ 未做 |
 
 ## 用法
 
 ```bash
+cargo run --release -- doctor                               # 不发录音，验 key / 区域 / 模型
+cargo run --release -- run                                  # 热键守护 + 历史（常驻）
 cargo run --release -- probe --seconds 3 --out /tmp/a.wav   # 验采集：打印电平、可落盘
 cargo run --release -- record                               # 录到静音自动结束，直接转写
 cargo run --release -- transcribe /tmp/a.wav                # 转写现成 WAV
@@ -28,6 +30,28 @@ cargo run --release -- history                              # 终端历史窗口
 
 历史窗口按键：`↑↓/jk` 选择 · `Enter` 复制（OSC 52，SSH 里也有效）· `/` 搜索 · `d` 删除 ·
 `c` 清空 · `r` 刷新 · `q` 退出。
+
+## 热键
+
+`dictate run` 常驻：按下热键开始录音，松开即提交，结果进历史窗。
+
+- **Linux**：读 `/dev/input/event*`（X11 / Wayland 通用）。需要 `input` 组：
+  `sudo usermod -aG input $USER` 然后重新登录。启动时会打印监听到的设备名。
+- **Windows**：`WH_KEYBOARD_LL` 低级钩子，不需要管理员权限（`cargo check --target x86_64-pc-windows-gnu` 通过，未在真机跑过）。
+- 默认 `ctrl+space`，可在配置里改：`hotkey = "alt+shift+d"` / `f9`（部分发行版把 `ctrl+space` 绑给了输入法切换，冲突就换一个）。
+
+## 支持的模型
+
+只有一个：
+
+| 模型 | 接口 | 说明 |
+|---|---|---|
+| `qwen3-asr-flash` | `POST {base}/compatible-mode/v1/chat/completions` | 官方文档里唯一支持 OpenAI 兼容模式的 ASR 模型；10 MB / 5 分钟 |
+
+配置里的 `model` 字段可以填别的名字，但**能不能跑取决于服务端是否接受同一种报文**：
+`qwen3-asr-flash-filetrans` 只走 DashScope 异步任务接口（形状完全不同，本项目不实现）；
+`qwen-audio-3.1-asr-flash` 是同步的，但走 DashScope 多模态端点，不保证兼容。
+填错的表现是 API 返回错误，会原样写进历史。用 `dictate doctor` 可以一次问清楚。
 
 ## 配置
 

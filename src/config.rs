@@ -27,6 +27,8 @@ pub struct Config {
     pub max_seconds: f32,
     /// 请求超时（秒）。
     pub timeout_secs: u64,
+    /// 全局热键：`ctrl+space` / `f9` / `alt+shift+d`。
+    pub hotkey: String,
 }
 
 impl Default for Config {
@@ -41,6 +43,7 @@ impl Default for Config {
             silence_stop_ms: 1500,
             max_seconds: 240.0,
             timeout_secs: 60,
+            hotkey: "ctrl+space".into(),
         }
     }
 }

@@ -11,16 +11,18 @@ mod asr;
 mod audio;
 mod config;
 mod history;
+mod hotkey;
+mod pipeline;
 mod tui;
 mod vad;
 
 use std::path::PathBuf;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{bail, Result};
 
 use agc::{lin_to_db, rms, Agc, AgcConfig};
 use audio::Downsampler;
-use history::{new_id, now_rfc3339, Entry, History};
+use history::History;
 
 fn main() {
     if let Err(e) = run() {
@@ -38,7 +40,12 @@ fn run() -> Result<()> {
         "probe" => cmd_probe(&args[1..]),
         "transcribe" => cmd_transcribe(&args[1..]),
         "record" => cmd_record(&args[1..]),
+        "doctor" => cmd_doctor(),
         "history" => tui::run(History::new(config::history_path())),
+        "run" => {
+            let cfg = config::load()?;
+            tui::run_live(cfg, History::new(config::history_path()))
+        }
         "-h" | "--help" | "help" => help(),
         other => {
             eprintln!("未知子命令：{other}\n");
@@ -54,13 +61,53 @@ fn help() -> Result<()> {
          dictate probe [--seconds 5] [--out out.wav]   录一段，打印电平，可落盘\n  \
          dictate transcribe <file.wav>                转写 WAV 并写入历史\n  \
          dictate record [--seconds 5]                 录一段并转写\n  \
-         dictate history                              终端历史窗口\n\n\
+         dictate doctor                              不发录音，验 key / 模型 / 区域\n  \
+         dictate run                                  热键守护 + 终端历史（常驻）\n  \
+         dictate history                              只看历史\n\n\
          配置：{}\n\
          历史：{}",
         config::config_path().display(),
         config::history_path().display()
     );
     Ok(())
+}
+
+/// 不录音也能验通路：发一段 1 秒正弦，看 key / 模型 / 区域对不对。
+fn cmd_doctor() -> Result<()> {
+    let cfg = config::load()?;
+    println!("配置：{}", config::config_path().display());
+    println!("端点：{}", cfg.endpoint());
+    println!("模型：{}", cfg.model);
+    println!(
+        "区域 key：{}",
+        match cfg.api_key() {
+            Some(_) => "已找到",
+            None => "缺失（DASHSCOPE_API_KEY 或配置文件 api_key）",
+        }
+    );
+    let client = asr::QwenClient::from_config(&cfg)?;
+
+    let samples: Vec<f32> = (0..audio::TARGET_RATE)
+        .map(|i| 0.1 * (2.0 * std::f32::consts::PI * 440.0 * i as f32 / audio::TARGET_RATE as f32).sin())
+        .collect();
+    let path = std::env::temp_dir().join(format!("dictate-doctor-{}.wav", std::process::id()));
+    audio::write_wav(&path, &samples)?;
+    let wav = std::fs::read(&path)?;
+    std::fs::remove_file(&path).ok();
+
+    print!("发一段 1 秒测试音… ");
+    match client.transcribe_wav(&wav) {
+        Ok(t) => {
+            println!("OK（{} ms）", t.latency_ms);
+            println!("返回文本：{:?}", t.text);
+            println!("说明：这段是正弦音，转写内容无意义，能返回就说明 key / 区域 / 模型都对。");
+            Ok(())
+        }
+        Err(e) => {
+            println!("失败");
+            Err(e)
+        }
+    }
 }
 
 fn flag<'a>(args: &'a [String], name: &str) -> Option<&'a str> {
@@ -116,9 +163,10 @@ fn cmd_transcribe(args: &[String]) -> Result<()> {
         bail!("用法：dictate transcribe <file.wav>");
     };
     let (rate, pcm) = audio::read_wav(std::path::Path::new(path))?;
-    let wav = prepare_wav(&pcm, rate)?;
     let cfg = config::load()?;
-    let text = transcribe_and_record(&cfg, &wav, pcm.len() as f32 / rate as f32)?;
+    let wav = pipeline::prepare_wav(&cfg, &pcm, rate)?;
+    let hist = History::new(config::history_path());
+    let text = pipeline::transcribe_and_record(&cfg, &hist, &wav, pcm.len() as f32 / rate as f32)?;
     println!("{text}");
     Ok(())
 }
@@ -135,75 +183,10 @@ fn cmd_record(args: &[String]) -> Result<()> {
     );
     let (rate, raw) = audio::record_until(max, cfg.silence_stop_ms)?;
     let secs = raw.len() as f32 / rate as f32;
-    let wav = prepare_wav(&raw, rate)?;
-    let text = transcribe_and_record(&cfg, &wav, secs)?;
+    let wav = pipeline::prepare_wav(&cfg, &raw, rate)?;
+    let hist = History::new(config::history_path());
+    let text = pipeline::transcribe_and_record(&cfg, &hist, &wav, secs)?;
     println!("{text}");
     Ok(())
 }
 
-/// 任意率/声道的 PCM → 16 kHz、去首尾静音、AGC、WAV 字节。
-fn prepare_wav(pcm: &[f32], rate: u32) -> Result<Vec<u8>> {
-    let cfg = config::load()?;
-    let mut mono = Vec::new();
-    let mut ds = Downsampler::new(rate)?;
-    ds.push(pcm, &mut mono)?;
-    ds.finish(&mut mono)?;
-
-    let trimmed = vad::trim_silence(&mono, audio::TARGET_RATE, 100).to_vec();
-    if trimmed.is_empty() {
-        bail!("这段里没有检测到语音（全在 {} dBFS 以下）", vad::SPEECH_DBFS);
-    }
-    if trimmed.len() as f32 / audio::TARGET_RATE as f32 > cfg.max_seconds {
-        bail!(
-            "录音 {:.1} 秒超过上限 {:.0} 秒（服务端 10 MB / 5 分钟硬限）",
-            trimmed.len() as f32 / audio::TARGET_RATE as f32,
-            cfg.max_seconds
-        );
-    }
-    let mut voiced = trimmed;
-    let mut agc = Agc::new(
-        audio::TARGET_RATE,
-        AgcConfig {
-            target_dbfs: cfg.target_rms_dbfs,
-            ..Default::default()
-        },
-    );
-    agc.process(&mut voiced);
-
-    let path = std::env::temp_dir().join(format!("dictate-{}.wav", new_id()));
-    audio::write_wav(&path, &voiced)?;
-    let bytes = std::fs::read(&path).with_context(|| format!("读回临时 WAV 失败：{}", path.display()))?;
-    std::fs::remove_file(&path).ok();
-    Ok(bytes)
-}
-
-fn transcribe_and_record(cfg: &config::Config, wav: &[u8], duration_secs: f32) -> Result<String> {
-    let client = asr::QwenClient::from_config(cfg)?;
-    let hist = History::new(config::history_path());
-    let entry = match client.transcribe_wav(wav) {
-        Ok(t) => Entry {
-            id: new_id(),
-            ts: now_rfc3339(),
-            duration_ms: (duration_secs * 1000.0) as u64,
-            latency_ms: t.latency_ms,
-            model: cfg.model.clone(),
-            status: "ok".into(),
-            text: t.text.clone(),
-        },
-        Err(e) => {
-            let entry = Entry {
-                id: new_id(),
-                ts: now_rfc3339(),
-                duration_ms: (duration_secs * 1000.0) as u64,
-                latency_ms: 0,
-                model: cfg.model.clone(),
-                status: format!("error: {e:#}"),
-                text: String::new(),
-            };
-            hist.append(&entry).ok();
-            return Err(e);
-        }
-    };
-    hist.append(&entry)?;
-    Ok(entry.text)
-}
