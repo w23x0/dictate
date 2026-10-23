@@ -64,25 +64,65 @@ pub fn acquire_single_instance() -> Option<std::fs::File> {
     }
 }
 
-/// 找一个能开的终端模拟器，在它里面跑 `dictate <sub>`。
+/// 终端模拟器的启动命令。优先用用户自己正在用的那个（`TERM_PROGRAM` / `TERMINAL`），
+/// 否则按常见顺序找——**不能**默认起 gnome-terminal，那会在别人的 Ghostty 之外再开一个窗口。
+pub fn terminal_candidates(exe: &str, sub: &str) -> Vec<Vec<String>> {
+    let mut out: Vec<Vec<String>> = Vec::new();
+    if let Ok(t) = std::env::var("TERMINAL") {
+        if !t.trim().is_empty() {
+            out.push(vec![t, "-e".into(), exe.into(), sub.into()]);
+        }
+    }
+    // 用户当前终端优先
+    let program = std::env::var("TERM_PROGRAM").unwrap_or_default().to_ascii_lowercase();
+    if program.contains("ghostty") {
+        out.push(vec!["ghostty".into(), "-e".into(), exe.into(), sub.into()]);
+    }
+    out.extend([
+        vec!["ghostty".into(), "-e".into(), exe.into(), sub.into()],
+        vec!["kitty".into(), exe.into(), sub.into()],
+        vec!["alacritty".into(), "-e".into(), exe.into(), sub.into()],
+        vec!["wezterm".into(), "start".into(), "--".into(), exe.into(), sub.into()],
+        vec!["konsole".into(), "-e".into(), exe.into(), sub.into()],
+        vec!["xfce4-terminal".into(), "-x".into(), exe.into(), sub.into()],
+        vec!["gnome-terminal".into(), "--".into(), exe.into(), sub.into()],
+        vec!["x-terminal-emulator".into(), "-e".into(), exe.into(), sub.into()],
+    ]);
+    out
+}
+
+/// 在终端模拟器里跑 `dictate <sub>`。
 pub fn spawn_terminal(sub: &str) -> Result<()> {
     use std::process::Command;
     let exe = std::env::current_exe()?;
     let exe_s = exe.to_string_lossy().to_string();
-
-    // 每家参数形状不同：gnome-terminal 用 `--`，其余用 `-e`。
-    let candidates: Vec<Vec<String>> = vec![
-        vec!["gnome-terminal".into(), "--".into(), exe_s.clone(), sub.into()],
-        vec!["konsole".into(), "-e".into(), exe_s.clone(), sub.into()],
-        vec!["xfce4-terminal".into(), "-x".into(), exe_s.clone(), sub.into()],
-        vec!["kitty".into(), exe_s.clone(), sub.into()],
-        vec!["alacritty".into(), "-e".into(), exe_s.clone(), sub.into()],
-        vec!["x-terminal-emulator".into(), "-e".into(), exe_s.clone(), sub.into()],
-    ];
-    for c in candidates {
+    for c in terminal_candidates(&exe_s, sub) {
         if Command::new(&c[0]).args(&c[1..]).spawn().is_ok() {
             return Ok(());
         }
     }
-    anyhow::bail!("找不到可用的终端模拟器（试过 gnome-terminal / konsole / xfce4-terminal / kitty / alacritty）")
+    anyhow::bail!("找不到可用的终端模拟器（试过 ghostty / kitty / alacritty / wezterm / konsole / xfce4-terminal / gnome-terminal）")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ghostty_is_preferred_when_running_in_it() {
+        std::env::set_var("TERM_PROGRAM", "ghostty");
+        let c = terminal_candidates("/bin/dictate", "history");
+        assert_eq!(c[0][0], "ghostty", "在 Ghostty 里就该用 Ghostty 开");
+        assert_eq!(c[0][1], "-e");
+        std::env::remove_var("TERM_PROGRAM");
+    }
+
+    #[test]
+    fn fallback_list_ends_with_xterm() {
+        std::env::remove_var("TERM_PROGRAM");
+        std::env::remove_var("TERMINAL");
+        let c = terminal_candidates("/bin/dictate", "settings");
+        assert!(c.iter().any(|v| v[0] == "gnome-terminal"));
+        assert_eq!(c.last().unwrap()[0], "x-terminal-emulator");
+    }
 }
