@@ -11,6 +11,8 @@
 set -euo pipefail
 
 REPO="${DICTATE_REPO:-w23x0/dictate}"                       # 形如 owner/dictate
+# 下载根：默认 GitHub；换成镜像或本地目录也能装（便于测试/国内加速）
+BASE_URL="${DICTATE_BASE_URL:-https://github.com/$REPO/releases}"
 VERSION="${DICTATE_VERSION:-latest}"
 PREFIX="${DICTATE_PREFIX:-$HOME/.local}"
 BIN_DIR="$PREFIX/bin"
@@ -57,9 +59,9 @@ else
   TMP="$(mktemp -d)"
   trap 'rm -rf "$TMP"' EXIT
   if [[ "$VERSION" == "latest" ]]; then
-    URL="https://github.com/$REPO/releases/latest/download/dictate-$TARGET.tar.gz"
+    URL="$BASE_URL/latest/download/dictate-$TARGET.tar.gz"
   else
-    URL="https://github.com/$REPO/releases/download/$VERSION/dictate-$TARGET.tar.gz"
+    URL="$BASE_URL/download/$VERSION/dictate-$TARGET.tar.gz"
   fi
   say "下载 $URL"
   curl -fsSL "$URL" -o "$TMP/dictate.tar.gz" || die "下载失败（这个平台还没有发布包？）"
@@ -69,6 +71,13 @@ fi
 
 say "已安装：$BIN_DIR/dictate"
 "$BIN_DIR/dictate" version
+
+# 只有装到标准位置时才写桌面入口与自启；测试用的临时前缀不碰用户环境
+if [[ "$BIN_DIR" != "$HOME/.local/bin" ]]; then
+  say "前缀不是 ~/.local/bin，跳过桌面入口与自启（只放了二进制）"
+  echo "  $BIN_DIR/dictate 可直接运行"
+  exit 0
+fi
 
 # 应用入口 + 图标（能被应用搜索找到）
 "$BIN_DIR/dictate" install-desktop >/dev/null 2>&1 || true
