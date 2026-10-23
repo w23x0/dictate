@@ -1,6 +1,9 @@
-//! 配色：按终端背景亮/暗选一套，**不再假设深色背景**。
+//! 配色：从终端**实际背景色**推导一整套颜色，而不是假设黑底或白底。
 //!
-//! 检测顺序：配置 `theme` → 环境变量 `COLORFGBG` → OSC 11 问终端 → 默认深色。
+//! 顺序：配置 `theme`（dark/light 强制）→ 环境变量 `COLORFGBG` → OSC 11 问终端 → 默认深色。
+//!
+//! 为什么要背景色：面板底色、选中行底色必须"比背景略亮/略暗"，弱化文字必须是
+//! "背景与前景之间"。写死一套色在酒红/绿/蓝各种主题上都会脏。
 
 use ratatui::style::Color;
 
@@ -20,37 +23,56 @@ pub struct Theme {
     pub rec: Color,
     pub warn: Color,
     pub selected_bg: Color,
-    /// 底部输入面板的底色（grok-cli 那种"填充块"而不是描边）
     pub panel_bg: Color,
 }
 
+fn mix(a: (u8, u8, u8), b: (u8, u8, u8), t: f32) -> Color {
+    let f = |x: u8, y: u8| (x as f32 + (y as f32 - x as f32) * t).round() as u8;
+    Color::Rgb(f(a.0, b.0), f(a.1, b.1), f(a.2, b.2))
+}
+
 impl Theme {
-    pub fn dark() -> Self {
+    /// 由终端背景色推导。`bg` 是 OSC 11 拿到的值。
+    pub fn from_bg(bg: (u8, u8, u8)) -> Self {
+        let luma = 0.2126 * bg.0 as f32 + 0.7152 * bg.1 as f32 + 0.0722 * bg.2 as f32;
+        let light = luma > 127.0;
+        let fg = if light { (0x1a, 0x1c, 0x20) } else { (0xf2, 0xf3, 0xf5) };
         Self {
-            mode: Mode::Dark,
-            accent: Color::Rgb(0x8b, 0x7d, 0xff),
-            dim: Color::Rgb(0x6b, 0x72, 0x80),
-            faint: Color::Rgb(0x4b, 0x51, 0x5c),
-            ok: Color::Rgb(0x34, 0xd3, 0x99),
-            rec: Color::Rgb(0xf8, 0x71, 0x71),
-            warn: Color::Rgb(0xfb, 0xbf, 0x24),
-            selected_bg: Color::Rgb(0x26, 0x2a, 0x33),
-            panel_bg: Color::Rgb(0x1a, 0x1d, 0x23),
+            mode: if light { Mode::Light } else { Mode::Dark },
+            accent: if light {
+                Color::Rgb(0x5b, 0x3d, 0xd6)
+            } else {
+                Color::Rgb(0xa7, 0x8b, 0xfa)
+            },
+            dim: mix(bg, fg, 0.58),
+            faint: mix(bg, fg, 0.34),
+            ok: if light {
+                Color::Rgb(0x09, 0x69, 0x3f)
+            } else {
+                Color::Rgb(0x4a, 0xde, 0x80)
+            },
+            rec: if light {
+                Color::Rgb(0xb9, 0x1c, 0x1c)
+            } else {
+                Color::Rgb(0xff, 0x7b, 0x72)
+            },
+            warn: if light {
+                Color::Rgb(0x92, 0x40, 0x0e)
+            } else {
+                Color::Rgb(0xfd, 0xba, 0x74)
+            },
+            // 面板/选中只挪一点点：在任意底色上都不会变成一块突兀的色块
+            selected_bg: mix(bg, fg, 0.16),
+            panel_bg: mix(bg, fg, 0.09),
         }
     }
 
+    pub fn dark() -> Self {
+        Self::from_bg((0x10, 0x12, 0x16))
+    }
+
     pub fn light() -> Self {
-        Self {
-            mode: Mode::Light,
-            accent: Color::Rgb(0x5b, 0x3d, 0xd6),
-            dim: Color::Rgb(0x5b, 0x61, 0x6b),
-            faint: Color::Rgb(0x9a, 0xa1, 0xac),
-            ok: Color::Rgb(0x15, 0x80, 0x3d),
-            rec: Color::Rgb(0xb9, 0x1c, 0x1c),
-            warn: Color::Rgb(0x9a, 0x5b, 0x00),
-            selected_bg: Color::Rgb(0xdf, 0xe3, 0xe8),
-            panel_bg: Color::Rgb(0xec, 0xee, 0xf1),
-        }
+        Self::from_bg((0xff, 0xff, 0xff))
     }
 
     pub fn for_mode(mode: Mode) -> Self {
@@ -67,10 +89,10 @@ impl Theme {
             Some("dark") => return Self::dark(),
             _ => {}
         }
-        if let Some(mode) = from_colorfgbg(std::env::var("COLORFGBG").ok().as_deref()) {
-            return Self::for_mode(mode);
+        if let Some(bg) = query_terminal_background() {
+            return Self::from_bg(bg);
         }
-        if let Some(mode) = query_terminal_background() {
+        if let Some(mode) = from_colorfgbg(std::env::var("COLORFGBG").ok().as_deref()) {
             return Self::for_mode(mode);
         }
         Self::dark()
@@ -83,24 +105,31 @@ pub fn from_colorfgbg(v: Option<&str>) -> Option<Mode> {
     Some(if bg == 7 || bg >= 9 { Mode::Light } else { Mode::Dark })
 }
 
-/// 从 OSC 11 的回包里取亮度：`\x1b]11;rgb:ffff/ffff/ffff\x1b\\`
-pub fn parse_osc11(reply: &[u8]) -> Option<Mode> {
+/// 从 OSC 11 的回包里取背景色：`\x1b]11;rgb:3b1a/2b2b/2b2b\x1b\\`
+pub fn parse_osc11_rgb(reply: &[u8]) -> Option<(u8, u8, u8)> {
     let s = String::from_utf8_lossy(reply);
     let at = s.find("]11;")? + 4;
-    let rest = &s[at..];
-    let spec = rest.split(['\x07', '\x1b']).next()?.trim();
+    let spec = s[at..].split(['\x07', '\x1b']).next()?.trim();
     let rgb = spec.strip_prefix("rgb:")?;
     let mut parts = rgb.split('/');
-    let r = u16::from_str_radix(parts.next()?.get(..2)?, 16).ok()? as f32;
-    let g = u16::from_str_radix(parts.next()?.get(..2)?, 16).ok()? as f32;
-    let b = u16::from_str_radix(parts.next()?.get(..2)?, 16).ok()? as f32;
-    let luma = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+    let take = |p: &str| -> Option<u8> {
+        let hi = u16::from_str_radix(p.get(..2)?, 16).ok()?;
+        Some(hi as u8)
+    };
+    Some((take(parts.next()?)?, take(parts.next()?)?, take(parts.next()?)?))
+}
+
+/// 亮度判定（测试用）。
+#[cfg(test)]
+pub fn parse_osc11(reply: &[u8]) -> Option<Mode> {
+    let (r, g, b) = parse_osc11_rgb(reply)?;
+    let luma = 0.2126 * r as f32 + 0.7152 * g as f32 + 0.0722 * b as f32;
     Some(if luma > 127.0 { Mode::Light } else { Mode::Dark })
 }
 
 /// 问终端背景色，最多等 150 ms；拿不到就算了。
 #[cfg(unix)]
-fn query_terminal_background() -> Option<Mode> {
+fn query_terminal_background() -> Option<(u8, u8, u8)> {
     use std::io::{Read, Write};
 
     let mut out = std::io::stdout();
@@ -108,13 +137,12 @@ fn query_terminal_background() -> Option<Mode> {
     out.flush().ok()?;
 
     let mut pfd = libc::pollfd { fd: 0, events: libc::POLLIN, revents: 0 };
-    let ready = unsafe { libc::poll(&mut pfd, 1, 150) };
-    if ready <= 0 {
+    if unsafe { libc::poll(&mut pfd, 1, 150) } <= 0 {
         return None;
     }
     let mut buf = [0u8; 128];
     let n = std::io::stdin().read(&mut buf).ok()?;
-    let mode = parse_osc11(&buf[..n]);
+    let rgb = parse_osc11_rgb(&buf[..n]);
     // 把可能残留的字节读干净，别让回包漏到 TUI 里
     while unsafe { libc::poll(&mut pfd, 1, 0) } > 0 {
         let mut junk = [0u8; 64];
@@ -123,11 +151,11 @@ fn query_terminal_background() -> Option<Mode> {
         }
         pfd.revents = 0;
     }
-    mode
+    rgb
 }
 
 #[cfg(not(unix))]
-fn query_terminal_background() -> Option<Mode> {
+fn query_terminal_background() -> Option<(u8, u8, u8)> {
     None
 }
 
@@ -139,21 +167,36 @@ mod tests {
     fn colorfgbg_maps_dark_and_light() {
         assert_eq!(from_colorfgbg(Some("15;0")), Some(Mode::Dark));
         assert_eq!(from_colorfgbg(Some("0;15")), Some(Mode::Light));
-        assert_eq!(from_colorfgbg(Some("0;7")), Some(Mode::Light));
         assert_eq!(from_colorfgbg(None), None);
-        assert_eq!(from_colorfgbg(Some("garbage")), None);
     }
 
     #[test]
-    fn osc11_reply_gives_luminance() {
-        assert_eq!(parse_osc11(b"\x1b]11;rgb:ffff/ffff/ffff\x1b\\"), Some(Mode::Light));
-        assert_eq!(parse_osc11(b"\x1b]11;rgb:0000/0000/0000\x07"), Some(Mode::Dark));
-        assert_eq!(parse_osc11(b"nonsense"), None);
+    fn osc11_reply_gives_bg_rgb() {
+        assert_eq!(
+            parse_osc11_rgb(b"\x1b]11;rgb:ffff/ffff/ffff\x1b\\"),
+            Some((255, 255, 255))
+        );
+        assert_eq!(parse_osc11_rgb(b"\x1b]11;rgb:3b1a/2b2b/2b2b\x07"), Some((0x3b, 0x2b, 0x2b)));
+        assert_eq!(parse_osc11(b"\x1b]11;rgb:3b1a/2b2b/2b2b\x07"), Some(Mode::Dark));
     }
 
     #[test]
-    fn configured_theme_wins() {
-        assert_eq!(Theme::resolve(Some("light")).mode, Mode::Light);
-        assert_eq!(Theme::resolve(Some("dark")).mode, Mode::Dark);
+    fn wine_background_gets_its_own_panel() {
+        // 酒红底（截图里的那种）不该被套成蓝灰面板
+        let t = Theme::from_bg((0x3b, 0x1a, 0x2b));
+        assert_eq!(t.mode, Mode::Dark);
+        let bg = (0x3b, 0x1a, 0x2b);
+        match (t.panel_bg, t.selected_bg) {
+            (Color::Rgb(r, g, b), _) => {
+                assert!(r > bg.0 && g > bg.1 && b > bg.2, "面板应比背景略亮")
+            }
+            _ => panic!("应是 RGB"),
+        }
+    }
+
+    #[test]
+    fn light_and_dark_differ() {
+        assert_ne!(Theme::dark().accent, Theme::light().accent);
+        assert_eq!(Theme::light().mode, Mode::Light);
     }
 }

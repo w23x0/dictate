@@ -38,6 +38,14 @@ fn main() {
 }
 
 fn run() -> Result<()> {
+    // 先处理颜色开关：`color = "always"` 时清掉 NO_COLOR（TUI 库会按它关掉全部颜色）
+    if let Ok(cfg) = config::load() {
+        match cfg.color.as_deref().map(|s| s.trim().to_ascii_lowercase()) {
+            Some(c) if c == "always" => std::env::remove_var("NO_COLOR"),
+            Some(c) if c == "never" => std::env::set_var("NO_COLOR", "1"),
+            _ => {}
+        }
+    }
     let args: Vec<String> = std::env::args().skip(1).collect();
     let Some(cmd) = args.first() else {
         // 无参数 = 托盘常驻（关掉终端也能用）

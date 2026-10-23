@@ -33,6 +33,8 @@ pub struct Config {
     pub api_style: Option<String>,
     /// 配色：`auto`（默认，问终端）/ `dark` / `light`。
     pub theme: Option<String>,
+    /// 颜色开关：`auto`（默认，尊重 NO_COLOR）/ `always`（强制彩色）/ `never`。
+    pub color: Option<String>,
 }
 
 impl Default for Config {
@@ -50,6 +52,7 @@ impl Default for Config {
             hotkey: "ctrl+space".into(),
             api_style: None,
             theme: None,
+            color: None,
         }
     }
 }
