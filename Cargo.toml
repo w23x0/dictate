@@ -28,6 +28,9 @@ chrono = { version = "0.4", features = ["serde"] }
 png = "0.17"
 tray-icon = "0.19"
 
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [target.'cfg(target_os = "linux")'.dependencies]
 evdev = "0.13"
 gtk = "0.18"

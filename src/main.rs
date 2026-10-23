@@ -17,6 +17,7 @@ mod hotkey;
 mod icon;
 mod pipeline;
 mod settings_ui;
+mod theme;
 mod tray;
 mod tui;
 mod vad;

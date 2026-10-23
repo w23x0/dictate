@@ -31,6 +31,8 @@ pub struct Config {
     pub hotkey: String,
     /// 强制报文形状：`openai` / `dashscope` / `ws`；留空则按模型名推断。
     pub api_style: Option<String>,
+    /// 配色：`auto`（默认，问终端）/ `dark` / `light`。
+    pub theme: Option<String>,
 }
 
 impl Default for Config {
@@ -47,6 +49,7 @@ impl Default for Config {
             timeout_secs: 60,
             hotkey: "ctrl+space".into(),
             api_style: None,
+            theme: None,
         }
     }
 }

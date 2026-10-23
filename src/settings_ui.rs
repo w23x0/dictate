@@ -10,7 +10,7 @@ use crossterm::terminal::{
 };
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout};
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph};
 use ratatui::Terminal;
@@ -18,6 +18,7 @@ use ratatui::Terminal;
 use unicode_width::UnicodeWidthStr;
 
 use crate::config::{self, Config};
+use crate::theme::{Mode, Theme};
 
 /// 按**显示宽度**补齐（中文占两格），否则中英混排的列会歪。
 fn pad(s: &str, width: usize) -> String {
@@ -29,7 +30,7 @@ fn pad(s: &str, width: usize) -> String {
     }
 }
 
-const FIELDS: [&str; 10] = [
+const FIELDS: [&str; 11] = [
     "服务地址",
     "模型",
     "报文形状",
@@ -40,6 +41,7 @@ const FIELDS: [&str; 10] = [
     "静音自动结束 (ms)",
     "单次上限 (s)",
     "超时 (s)",
+    "配色 (auto/dark/light)",
 ];
 
 struct Form {
@@ -50,6 +52,7 @@ struct Form {
     status: String,
     dirty: bool,
     test: Option<Receiver<Result<(u64, String), String>>>,
+    theme: Theme,
 }
 
 impl Form {
@@ -62,6 +65,7 @@ impl Form {
             status: String::new(),
             dirty: false,
             test: None,
+            theme: Theme::dark(),
         }
     }
 
@@ -84,8 +88,25 @@ impl Form {
             7 => self.cfg.silence_stop_ms.to_string(),
             8 => format!("{}", self.cfg.max_seconds),
             9 => self.cfg.timeout_secs.to_string(),
+            10 => self
+                .cfg
+                .theme
+                .clone()
+                .unwrap_or_else(|| "auto（问终端）".into()),
             _ => String::new(),
         }
+    }
+
+    fn cycle_theme(&mut self, dir: i32) {
+        let order = [None, Some("dark"), Some("light")];
+        let cur = order
+            .iter()
+            .position(|s| s.map(|x| x.to_string()) == self.cfg.theme)
+            .unwrap_or(0) as i32;
+        let next = ((cur + dir).rem_euclid(order.len() as i32)) as usize;
+        self.cfg.theme = order[next].map(|s| s.to_string());
+        self.theme = Theme::resolve(self.cfg.theme.as_deref());
+        self.dirty = true;
     }
 
     fn start_edit(&mut self) {
@@ -97,6 +118,10 @@ impl Form {
         }
         if i == 2 {
             self.cycle_style(1);
+            return;
+        }
+        if i == 10 {
+            self.cycle_theme(1);
             return;
         }
         self.editing = true;
@@ -201,6 +226,7 @@ pub fn run() -> Result<()> {
     let mut form = Form::new(cfg);
 
     enable_raw_mode()?;
+    form.theme = Theme::resolve(form.cfg.theme.as_deref());
     let mut out = std::io::stdout();
     execute!(out, EnterAlternateScreen)?;
     let mut term = Terminal::new(CrosstermBackend::new(out))?;
@@ -270,6 +296,8 @@ fn event_loop(term: &mut Terminal<CrosstermBackend<std::io::Stdout>>, f: &mut Fo
             KeyCode::Enter => f.start_edit(),
             KeyCode::Left if f.sel == 2 => f.cycle_style(-1),
             KeyCode::Right if f.sel == 2 => f.cycle_style(1),
+            KeyCode::Left if f.sel == 10 => f.cycle_theme(-1),
+            KeyCode::Right if f.sel == 10 => f.cycle_theme(1),
             KeyCode::Char(' ') if f.sel == 5 => {
                 f.cfg.enable_itn = !f.cfg.enable_itn;
                 f.dirty = true;
@@ -282,6 +310,7 @@ fn event_loop(term: &mut Terminal<CrosstermBackend<std::io::Stdout>>, f: &mut Fo
 }
 
 fn draw(fr: &mut ratatui::Frame, f: &Form) {
+    let theme = f.theme;
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -292,13 +321,22 @@ fn draw(fr: &mut ratatui::Frame, f: &Form) {
         .split(fr.area());
     fr.render_widget(
         Paragraph::new(Line::from(vec![
-            Span::styled("◆ ", Style::default().fg(Color::Rgb(0x8b, 0x7d, 0xff))),
+            Span::styled("◆ ", Style::default().fg(theme.accent)),
             Span::styled("dictate", Style::default().add_modifier(Modifier::BOLD)),
             Span::styled(
                 format!("  v{}", env!("CARGO_PKG_VERSION")),
-                Style::default().fg(Color::Rgb(0x3f, 0x44, 0x4d)),
+                Style::default().fg(theme.faint),
             ),
-            Span::styled("  ·  设置", Style::default().fg(Color::Rgb(0x6b, 0x72, 0x80))),
+            Span::styled(
+                format!(
+                    "  ·  设置（{}）",
+                    match theme.mode {
+                        Mode::Dark => "深色",
+                        Mode::Light => "浅色",
+                    }
+                ),
+                Style::default().fg(theme.dim),
+            ),
         ])),
         chunks[0],
     );
@@ -315,7 +353,7 @@ fn draw(fr: &mut ratatui::Frame, f: &Form) {
             ListItem::new(Line::from(vec![
                 Span::styled(
                     pad(label, 24),
-                    Style::default().fg(Color::Rgb(0x6b, 0x72, 0x80)),
+                    Style::default().fg(theme.dim),
                 ),
                 Span::styled(value, Style::default()),
             ]))
@@ -329,16 +367,16 @@ fn draw(fr: &mut ratatui::Frame, f: &Form) {
             Block::default()
                 .borders(Borders::ALL)
                 .border_type(ratatui::widgets::BorderType::Rounded)
-                .border_style(Style::default().fg(Color::Rgb(0x3f, 0x44, 0x4d)))
+                .border_style(Style::default().fg(theme.faint))
                 .title(Span::styled(
                     " 设置 ",
-                    Style::default().fg(Color::Rgb(0x6b, 0x72, 0x80)),
+                    Style::default().fg(theme.dim),
                 ))
                 .padding(ratatui::widgets::Padding::horizontal(1)),
         )
         .highlight_style(
             Style::default()
-                .bg(Color::Rgb(0x1f, 0x22, 0x2b))
+                .bg(theme.selected_bg)
                 .add_modifier(Modifier::BOLD),
         )
         .highlight_symbol("❯ ");
@@ -353,8 +391,8 @@ fn draw(fr: &mut ratatui::Frame, f: &Form) {
     };
     fr.render_widget(
         Paragraph::new(vec![
-            Line::from(Span::styled(help, Style::default().fg(Color::Rgb(0x3f, 0x44, 0x4d)))),
-            Line::from(Span::styled(status, Style::default().fg(Color::Rgb(0x34, 0xd3, 0x99)))),
+            Line::from(Span::styled(help, Style::default().fg(theme.faint))),
+            Line::from(Span::styled(status, Style::default().fg(theme.ok))),
         ]),
         chunks[2],
     );

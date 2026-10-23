@@ -480,6 +480,7 @@ dependencies = [
  "futures-util",
  "gtk",
  "hound",
+ "libc",
  "png",
  "ratatui",
  "reqwest",

@@ -22,6 +22,7 @@ use ratatui::Terminal;
 
 use crate::config::Config;
 use crate::history::{Entry, History};
+use crate::theme::Theme;
 use crate::hotkey::{self, HotkeyEvent};
 use crate::pipeline;
 
@@ -43,10 +44,11 @@ struct App {
     phase: Phase,
     /// 顶栏副标题（热键 · 模型），只在 run 模式有
     subtitle: String,
+    theme: Theme,
 }
 
 impl App {
-    fn new(history: History) -> Self {
+    fn new(history: History, theme: Theme) -> Self {
         let mut app = Self {
             history,
             all: Vec::new(),
@@ -57,6 +59,7 @@ impl App {
             status: String::new(),
             phase: Phase::Idle,
             subtitle: String::new(),
+            theme,
         };
         app.reload();
         app
@@ -94,7 +97,11 @@ pub fn osc52(text: &str) -> String {
 }
 
 pub fn run(history: History) -> Result<()> {
-    with_terminal(|term| event_loop(term, &mut App::new(history), None))
+    // 配色要问终端背景色，必须在 raw mode 之后问，否则回包会被回显
+    with_terminal(|term| {
+        let theme = Theme::resolve(crate::config::load().ok().and_then(|c| c.theme).as_deref());
+        event_loop(term, &mut App::new(history, theme), None)
+    })
 }
 
 /// 热键守护：一边听热键，一边显示历史。
@@ -104,7 +111,9 @@ pub fn run_live(cfg: Config, history: History) -> Result<()> {
     hotkey::spawn(spec, tx, false)?;
     let capture = crate::audio::spawn_capture()?;
 
-    let mut app = App::new(history);
+    let theme_cfg = cfg.theme.clone();
+    let mut app = App::new(history, Theme::dark());
+    app.theme = Theme::resolve(theme_cfg.as_deref());
     app.subtitle = format!("{} · {}", cfg.hotkey, cfg.model);
     app.status = "等待热键…".to_string();
     let mut live = Live { cfg, capture, hk: hk_rx, worker: channel(), busy: false };
@@ -295,15 +304,10 @@ fn pump_live(app: &mut App, live: &mut Live) -> Result<()> {
     Ok(())
 }
 
-const ACCENT: Color = Color::Rgb(0x8b, 0x7d, 0xff);
-const DIM: Color = Color::Rgb(0x6b, 0x72, 0x80);
-const FAINT: Color = Color::Rgb(0x3f, 0x44, 0x4d);
-const OK: Color = Color::Rgb(0x34, 0xd3, 0x99);
-const REC: Color = Color::Rgb(0xf8, 0x71, 0x71);
-const WARN: Color = Color::Rgb(0xfb, 0xbf, 0x24);
-
 fn draw(f: &mut ratatui::Frame, app: &App) {
     use ratatui::widgets::Padding;
+
+    let th = app.theme;
 
     let area = f.area();
     let chunks = Layout::default()
@@ -318,24 +322,24 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
 
     // ── 顶栏：品牌 + 模型/热键 + 相位
     let left = Line::from(vec![
-        Span::styled("◆ ", Style::default().fg(ACCENT)),
+        Span::styled("◆ ", Style::default().fg(th.accent)),
         Span::styled("dictate", Style::default().add_modifier(Modifier::BOLD)),
-        Span::styled(format!("  v{}", env!("CARGO_PKG_VERSION")), Style::default().fg(FAINT)),
+        Span::styled(format!("  v{}", env!("CARGO_PKG_VERSION")), Style::default().fg(th.faint)),
         Span::styled(
             if app.subtitle.is_empty() { String::new() } else { format!("  {}", app.subtitle) },
-            Style::default().fg(DIM),
+            Style::default().fg(th.dim),
         ),
     ]);
     let (dot, dot_color, phase_text) = match app.phase {
-        Phase::Idle => ("●", OK, "就绪".to_string()),
-        Phase::Recording(_) => ("●", REC, "录音中".to_string()),
-        Phase::Transcribing(_) => ("●", WARN, "转写中".to_string()),
+        Phase::Idle => ("●", th.ok, "就绪".to_string()),
+        Phase::Recording(_) => ("●", th.rec, "录音中".to_string()),
+        Phase::Transcribing(_) => ("●", th.warn, "转写中".to_string()),
     };
     let right = Line::from(vec![
         Span::styled(format!("{dot} {phase_text}"), Style::default().fg(dot_color)),
         Span::styled(
             format!("   {} 条 ", app.shown.len()),
-            Style::default().fg(DIM),
+            Style::default().fg(th.dim),
         ),
     ])
     .alignment(ratatui::layout::Alignment::Right);
@@ -351,8 +355,8 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(ratatui::widgets::BorderType::Rounded)
-        .border_style(Style::default().fg(FAINT))
-        .title(Span::styled(" 历史 ", Style::default().fg(DIM)))
+        .border_style(Style::default().fg(th.faint))
+        .title(Span::styled(" 历史 ", Style::default().fg(th.dim)))
         .padding(Padding::horizontal(1));
 
     if app.shown.is_empty() {
@@ -362,7 +366,7 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
             "没有匹配的记录"
         };
         f.render_widget(
-            Paragraph::new(Line::from(Span::styled(msg, Style::default().fg(DIM))))
+            Paragraph::new(Line::from(Span::styled(msg, Style::default().fg(th.dim))))
                 .block(block)
                 .alignment(ratatui::layout::Alignment::Center),
             chunks[1],
@@ -379,17 +383,17 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
                 let (body, color) = if e.is_ok() {
                     (e.text.replace('\n', " "), Color::Reset)
                 } else {
-                    (e.status.trim_start_matches("error: ").replace('\n', " "), REC)
+                    (e.status.trim_start_matches("error: ").replace('\n', " "), th.rec)
                 };
                 Row::new(vec![
-                    Cell::from(Span::styled(time.to_string(), Style::default().fg(FAINT))),
+                    Cell::from(Span::styled(time.to_string(), Style::default().fg(th.faint))),
                     Cell::from(Line::from(vec![
-                        Span::styled("❯ ", Style::default().fg(ACCENT)),
+                        Span::styled("❯ ", Style::default().fg(th.accent)),
                         Span::styled(body, Style::default().fg(color)),
                     ])),
                     Cell::from(Span::styled(
                         format!("{:.1}s", e.duration_ms as f32 / 1000.0),
-                        Style::default().fg(FAINT),
+                        Style::default().fg(th.faint),
                     )),
                 ])
             })
@@ -402,7 +406,7 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
         .block(block)
         .row_highlight_style(
             Style::default()
-                .bg(Color::Rgb(0x1f, 0x22, 0x2b))
+                .bg(th.selected_bg)
                 .add_modifier(Modifier::BOLD),
         );
 
@@ -415,49 +419,49 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
     let (line, color) = if app.searching {
         (
             Line::from(vec![
-                Span::styled("/ ", Style::default().fg(ACCENT)),
+                Span::styled("/ ", Style::default().fg(th.accent)),
                 Span::raw(app.query.clone()),
-                Span::styled("▏", Style::default().fg(ACCENT)),
+                Span::styled("▏", Style::default().fg(th.accent)),
             ]),
-            ACCENT,
+            th.accent,
         )
     } else {
         match app.phase {
             Phase::Idle => (
                 Line::from(vec![
-                    Span::styled("○ ", Style::default().fg(OK)),
+                    Span::styled("○ ", Style::default().fg(th.ok)),
                     Span::styled(
                         if app.status.is_empty() { "等待热键…".to_string() } else { app.status.clone() },
-                        Style::default().fg(DIM),
+                        Style::default().fg(th.dim),
                     ),
                     if app.subtitle.is_empty() {
-                        Span::styled("   （只读）", Style::default().fg(FAINT))
+                        Span::styled("   （只读）", Style::default().fg(th.faint))
                     } else {
-                        Span::styled("   按住热键说话", Style::default().fg(FAINT))
+                        Span::styled("   按住热键说话", Style::default().fg(th.faint))
                     },
                 ]),
-                FAINT,
+                th.faint,
             ),
             Phase::Recording(t) => (
                 Line::from(vec![
-                    Span::styled("● ", Style::default().fg(REC)),
+                    Span::styled("● ", Style::default().fg(th.rec)),
                     Span::styled(
                         format!("录音中 {:.1}s", t.elapsed().as_secs_f32()),
-                        Style::default().fg(REC).add_modifier(Modifier::BOLD),
+                        Style::default().fg(th.rec).add_modifier(Modifier::BOLD),
                     ),
-                    Span::styled("   松开提交，Esc 取消", Style::default().fg(DIM)),
+                    Span::styled("   松开提交，Esc 取消", Style::default().fg(th.dim)),
                 ]),
-                REC,
+                th.rec,
             ),
             Phase::Transcribing(t) => {
                 const FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
                 let frame = FRAMES[(t.elapsed().as_millis() / 80) as usize % FRAMES.len()];
                 (
                     Line::from(vec![
-                        Span::styled(format!("{frame} "), Style::default().fg(WARN)),
-                        Span::styled("转写中…", Style::default().fg(WARN)),
+                        Span::styled(format!("{frame} "), Style::default().fg(th.warn)),
+                        Span::styled("转写中…", Style::default().fg(th.warn)),
                     ]),
-                    WARN,
+                    th.warn,
                 )
             }
         }
@@ -473,7 +477,7 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
             "↑↓ 选择   ⏎ 复制   / 搜索   d 删除   c 清空   q 退出",
-            Style::default().fg(FAINT),
+            Style::default().fg(th.faint),
         ))),
         chunks[3],
     );
