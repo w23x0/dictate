@@ -187,8 +187,11 @@ where
 
 /// 把守护进程的状态文件映射成本地相位（用时间差还原已过去多久）。
 fn apply_status(app: &mut App) {
-    let path = crate::config::status_path();
-    let Ok(body) = std::fs::read_to_string(&path) else {
+    apply_status_from(&crate::config::status_path(), app);
+}
+
+fn apply_status_from(path: &std::path::Path, app: &mut App) {
+    let Ok(body) = std::fs::read_to_string(path) else {
         app.phase = Phase::Idle;
         app.status = "守护进程没在跑 —— 先执行 dictate".into();
         return;
@@ -758,8 +761,7 @@ mod tests {
     #[test]
     fn typing_slash_opens_command_palette_state() {
         let dir = std::env::temp_dir().join(format!("dictate-cli-{}", std::process::id()));
-        std::env::set_var("XDG_DATA_HOME", &dir);
-        let mut app = app_with(dir.join("dictate").to_str().unwrap());
+        let mut app = app_with(dir.to_str().unwrap());
         handle_key(&mut app, &key('/')).unwrap();
         assert_eq!(app.input, "/");
         handle_key(&mut app, &key('s')).unwrap();
@@ -777,8 +779,7 @@ mod tests {
     #[test]
     fn enter_runs_settings_command() {
         let dir = std::env::temp_dir().join(format!("dictate-cli2-{}", std::process::id()));
-        std::env::set_var("XDG_DATA_HOME", &dir);
-        let mut app = app_with(dir.join("dictate").to_str().unwrap());
+        let mut app = app_with(dir.to_str().unwrap());
         for c in "/settings".chars() {
             handle_key(&mut app, &key(c)).unwrap();
         }
@@ -791,8 +792,7 @@ mod tests {
     #[test]
     fn esc_clears_input_then_quits() {
         let dir = std::env::temp_dir().join(format!("dictate-cli3-{}", std::process::id()));
-        std::env::set_var("XDG_DATA_HOME", &dir);
-        let mut app = app_with(dir.join("dictate").to_str().unwrap());
+        let mut app = app_with(dir.to_str().unwrap());
         for c in "abc".chars() {
             handle_key(&mut app, &key(c)).unwrap();
         }
@@ -807,22 +807,21 @@ mod tests {
     fn status_file_maps_to_phases() {
         // 直接构造状态文件，验证相位映射（attach 模式的核心）
         let dir = std::env::temp_dir().join(format!("dictate-status-{}", std::process::id()));
-        std::fs::create_dir_all(dir.join("dictate")).unwrap();
-        std::env::set_var("XDG_DATA_HOME", &dir);
-        let path = dir.join("dictate/status.json");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("status.json");
 
         std::fs::write(&path, r#"{"phase":"recording","since_ms":0}"#).unwrap();
         let mut app = App::new(History::new(dir.join("history.jsonl")), Theme::dark());
-        apply_status(&mut app);
+        apply_status_from(&path, &mut app);
         assert!(matches!(app.phase, Phase::Recording(_)));
 
         std::fs::write(&path, r#"{"phase":"idle","since_ms":0,"text":"你好"}"#).unwrap();
-        apply_status(&mut app);
+        apply_status_from(&path, &mut app);
         assert_eq!(app.phase, Phase::Idle);
         assert!(app.status.contains("你好"));
 
         std::fs::write(&path, r#"{"phase":"idle","since_ms":0,"error":"HTTP 401"}"#).unwrap();
-        apply_status(&mut app);
+        apply_status_from(&path, &mut app);
         assert!(app.status.contains("401"));
 
         std::fs::remove_dir_all(&dir).ok();
