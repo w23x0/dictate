@@ -569,7 +569,9 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
         let items: Vec<ListItem> = app
             .shown
             .iter()
-            .map(|i| {
+            .enumerate()
+            .map(|(pos, i)| {
+                let is_selected = pos == app.selected;
                 let e = &app.all[*i];
                 let time = e.ts.get(11..16).unwrap_or("--:--");
                 let (body, color) = if e.is_ok() {
@@ -577,7 +579,9 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
                 } else {
                     (e.status.trim_start_matches("error: ").replace('\n', " "), th.rec)
                 };
+                let marker = if is_selected { "▌" } else { " " };
                 ListItem::new(Line::from(vec![
+                    Span::styled(marker.to_string(), Style::default().fg(th.accent)),
                     Span::styled(format!(" {time}  "), Style::default().fg(th.faint)),
                     Span::styled("❯ ", Style::default().fg(th.accent)),
                     Span::styled(body, Style::default().fg(color)),
@@ -589,7 +593,7 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
             })
             .collect();
         let list = List::new(items)
-            .highlight_style(Style::default().bg(th.selected_bg))
+            .highlight_style(Style::default().bg(th.selected_bg).add_modifier(Modifier::BOLD))
             .highlight_symbol("");
         let mut state = ListState::default();
         state.select(Some(app.selected));

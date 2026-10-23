@@ -255,6 +255,14 @@ impl Form {
         }
     }
 
+    /// 自动保存：不发状态提示（状态由调用方决定）。
+    fn save_silent(&mut self) -> Result<()> {
+        crate::asr::pick_style(&self.cfg.model, self.cfg.api_style.as_deref())?;
+        config::write(&config::config_path(), &self.cfg)?;
+        self.dirty = false;
+        Ok(())
+    }
+
     fn save(&mut self) -> Result<()> {
         crate::asr::pick_style(&self.cfg.model, self.cfg.api_style.as_deref())?;
         let path = config::config_path();
@@ -427,6 +435,13 @@ fn key(f: &mut Form, k: &crossterm::event::KeyEvent) -> Result<bool> {
         KeyCode::Char('s') if k.modifiers.contains(KeyModifiers::CONTROL) => f.save()?,
         KeyCode::F(3) => f.run_test(),
         _ => {}
+    }
+    // 改完立刻落盘：不要求用户记得按保存键
+    if f.dirty {
+        match f.save_silent() {
+            Ok(()) => {}
+            Err(e) => f.status = format!("保存失败：{e:#}"),
+        }
     }
     Ok(false)
 }
