@@ -1,0 +1,32 @@
+[package]
+name = "dictate"
+version = "0.1.0"
+edition = "2021"
+description = "Qwen ASR 听写器：热键 → 采集 → 门 → AGC → 转写 → 历史（终端 TUI）"
+license = "MIT"
+
+[dependencies]
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+base64 = "0.22"
+hound = "3.5"
+cpal = "0.16"
+rubato = "0.16"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+ratatui = "0.29"
+crossterm = "0.28"
+dirs = "6"
+chrono = { version = "0.4", features = ["serde"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+evdev = "0.13"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging", "Win32_UI_Input_KeyboardAndMouse"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
