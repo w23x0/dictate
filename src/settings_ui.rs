@@ -30,6 +30,21 @@ fn pad(s: &str, width: usize) -> String {
     }
 }
 
+/// 支持的模型（只列真的能用这三种报文形状跑的）。
+const MODELS: &[(&str, &str)] = &[
+    ("qwen3-asr-flash", "OpenAI 兼容 · 10 MB / 5 分钟 · 支持 ITN、语言指定"),
+    ("qwen-audio-3.1-asr-flash", "DashScope 同步 · 2 GB / 5 分钟"),
+    ("qwen-audio-3.0-asr-flash", "DashScope 同步 · 2 GB / 5 分钟"),
+    ("qwen-audio-3.1-asr-flash-message", "WebSocket · 只收 16 kHz"),
+    ("qwen-audio-3.1-asr-flash-streaming", "WebSocket 流式输出"),
+    ("qwen3-asr-flash-realtime", "WebSocket 实时"),
+];
+
+const BASES: &[(&str, &str)] = &[
+    ("https://dashscope.aliyuncs.com", "中国（北京）"),
+    ("https://dashscope-intl.aliyuncs.com", "新加坡"),
+];
+
 const FIELDS: [&str; 11] = [
     "服务地址",
     "模型",
@@ -53,6 +68,14 @@ struct Form {
     dirty: bool,
     test: Option<Receiver<Result<(u64, String), String>>>,
     theme: Theme,
+    picker: Option<Picker>,
+}
+
+struct Picker {
+    title: &'static str,
+    items: &'static [(&'static str, &'static str)],
+    sel: usize,
+    field: usize,
 }
 
 impl Form {
@@ -66,18 +89,27 @@ impl Form {
             dirty: false,
             test: None,
             theme: Theme::dark(),
+            picker: None,
         }
     }
 
     fn value(&self, i: usize) -> String {
         match i {
-            0 => self.cfg.base_url.clone(),
-            1 => self.cfg.model.clone(),
-            2 => self
-                .cfg
-                .api_style
-                .clone()
-                .unwrap_or_else(|| "auto（按模型名）".into()),
+            0 => {
+                let hit = BASES.iter().find(|(u, _)| *u == self.cfg.base_url);
+                match hit {
+                    Some((_, label)) => format!("{}（{}）", self.cfg.base_url, label),
+                    None => self.cfg.base_url.clone(),
+                }
+            }
+            1 => match crate::asr::pick_style(&self.cfg.model, self.cfg.api_style.as_deref()) {
+                Ok(style) => format!("{}（{}）", self.cfg.model, style.name()),
+                Err(_) => self.cfg.model.clone(),
+            },
+            2 => match crate::asr::pick_style(&self.cfg.model, self.cfg.api_style.as_deref()) {
+                Ok(style) => format!("{}（由模型决定）", style.name()),
+                Err(_) => "未知".into(),
+            },
             3 => match &self.cfg.api_key {
                 Some(k) if !k.is_empty() => mask(k),
                 _ => "（未设置，可用 DASHSCOPE_API_KEY）".into(),
@@ -116,18 +148,44 @@ impl Form {
             self.dirty = true;
             return;
         }
-        if i == 2 {
-            self.cycle_style(1);
-            return;
-        }
         if i == 10 {
             self.cycle_theme(1);
             return;
         }
+        if i == 1 {
+            self.picker = Some(Picker {
+                title: "选择模型",
+                items: MODELS,
+                sel: MODELS.iter().position(|(m, _)| *m == self.cfg.model).unwrap_or(0),
+                field: 1,
+            });
+            return;
+        }
+        if i == 0 {
+            self.picker = Some(Picker {
+                title: "选择服务地址",
+                items: BASES,
+                sel: BASES
+                    .iter()
+                    .position(|(u, _)| *u == self.cfg.base_url)
+                    .unwrap_or(0),
+                field: 0,
+            });
+            return;
+        }
         self.editing = true;
         self.buf = match i {
-            0 => self.cfg.base_url.clone(),
-            1 => self.cfg.model.clone(),
+            0 => {
+                let hit = BASES.iter().find(|(u, _)| *u == self.cfg.base_url);
+                match hit {
+                    Some((_, label)) => format!("{}（{}）", self.cfg.base_url, label),
+                    None => self.cfg.base_url.clone(),
+                }
+            }
+            1 => match crate::asr::pick_style(&self.cfg.model, self.cfg.api_style.as_deref()) {
+                Ok(style) => format!("{}（{}）", self.cfg.model, style.name()),
+                Err(_) => self.cfg.model.clone(),
+            },
             3 => self.cfg.api_key.clone().unwrap_or_default(),
             4 => self.cfg.language.clone().unwrap_or_default(),
             6 => self.cfg.hotkey.clone(),
@@ -136,17 +194,6 @@ impl Form {
             9 => self.cfg.timeout_secs.to_string(),
             _ => String::new(),
         };
-    }
-
-    fn cycle_style(&mut self, dir: i32) {
-        let order = [None, Some("openai"), Some("dashscope"), Some("ws")];
-        let cur = order
-            .iter()
-            .position(|s| s.map(|x| x.to_string()) == self.cfg.api_style)
-            .unwrap_or(0) as i32;
-        let next = ((cur + dir).rem_euclid(order.len() as i32)) as usize;
-        self.cfg.api_style = order[next].map(|s| s.to_string());
-        self.dirty = true;
     }
 
     fn commit_edit(&mut self) {
@@ -257,6 +304,38 @@ fn event_loop(term: &mut Terminal<CrosstermBackend<std::io::Stdout>>, f: &mut Fo
             continue;
         }
 
+        if f.picker.is_some() {
+            if k.code == KeyCode::Char('q') {
+                return Ok(());
+            }
+        }
+        if let Some(p) = f.picker.as_mut() {
+            match k.code {
+                KeyCode::Esc => f.picker = None,
+                KeyCode::Up | KeyCode::Char('k') => p.sel = p.sel.saturating_sub(1),
+                KeyCode::Down | KeyCode::Char('j') => {
+                    if p.sel + 1 < p.items.len() {
+                        p.sel += 1;
+                    }
+                }
+                KeyCode::Enter => {
+                    let chosen = p.items[p.sel].0;
+                    let field = p.field;
+                    if field == 0 {
+                        f.cfg.base_url = chosen.to_string();
+                    } else {
+                        f.cfg.model = chosen.to_string();
+                        f.cfg.api_style = None; // 形状跟着模型自动选
+                    }
+                    f.dirty = true;
+                    f.picker = None;
+                    f.status = format!("已选择 {chosen}（按 s 保存）");
+                }
+                _ => {}
+            }
+            continue;
+        }
+
         if f.editing {
             match k.code {
                 KeyCode::Esc => {
@@ -294,8 +373,6 @@ fn event_loop(term: &mut Terminal<CrosstermBackend<std::io::Stdout>>, f: &mut Fo
                 }
             }
             KeyCode::Enter => f.start_edit(),
-            KeyCode::Left if f.sel == 2 => f.cycle_style(-1),
-            KeyCode::Right if f.sel == 2 => f.cycle_style(1),
             KeyCode::Left if f.sel == 10 => f.cycle_theme(-1),
             KeyCode::Right if f.sel == 10 => f.cycle_theme(1),
             KeyCode::Char(' ') if f.sel == 5 => {
@@ -312,6 +389,52 @@ fn event_loop(term: &mut Terminal<CrosstermBackend<std::io::Stdout>>, f: &mut Fo
 fn draw(fr: &mut ratatui::Frame, f: &Form) {
     let th = f.theme;
     use ratatui::layout::Rect;
+
+    // 选择器：独占整屏（比半透明浮层干净，终端里也没有"半透明"这回事）
+    if let Some(p) = &f.picker {
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(1),
+                Constraint::Length(1),
+                Constraint::Min(3),
+                Constraint::Length(1),
+            ])
+            .split(fr.area());
+        fr.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled("◆ ", Style::default().fg(th.accent)),
+                Span::styled("dictate", Style::default().add_modifier(Modifier::BOLD)),
+                Span::styled(format!("  ·  {}", p.title), Style::default().fg(th.dim)),
+            ])),
+            chunks[0],
+        );
+        let rows: Vec<ListItem> = p
+            .items
+            .iter()
+            .map(|(name, desc)| {
+                ListItem::new(Line::from(vec![
+                    Span::styled(format!(" {name}  "), Style::default()),
+                    Span::styled(desc.to_string(), Style::default().fg(th.dim)),
+                ]))
+            })
+            .collect();
+        let mut state = ListState::default();
+        state.select(Some(p.sel));
+        let list = List::new(rows)
+            .highlight_style(Style::default().bg(th.selected_bg).add_modifier(Modifier::BOLD))
+            .highlight_symbol("❯");
+        fr.render_stateful_widget(list, chunks[2], &mut state);
+        fr.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                "↑↓ 选择   ⏎ 确认   Esc 取消",
+                Style::default().fg(th.faint),
+            )))
+            .alignment(ratatui::layout::Alignment::Right),
+            chunks[3],
+        );
+        return;
+    }
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -392,7 +515,7 @@ fn draw(fr: &mut ratatui::Frame, f: &Form) {
     let hints = Rect { y: panel.y + 1, ..inner };
     fr.render_widget(
         Paragraph::new(Line::from(Span::styled(
-            "↑↓ 选择   Enter 修改   ←→ 切换   s 保存   t 测试   q 退出",
+            "↑↓ 选择   ⏎ 修改/选择   ←→ 切换   s 保存   t 测试   q 退出",
             Style::default().fg(th.faint),
         )))
         .alignment(ratatui::layout::Alignment::Right)
@@ -412,15 +535,16 @@ mod tests {
     }
 
     #[test]
-    fn style_cycles_through_all_values() {
-        let mut f = Form::new(Config::default());
-        f.sel = 2;
-        f.cycle_style(1);
-        assert_eq!(f.cfg.api_style.as_deref(), Some("openai"));
-        f.cycle_style(1);
-        assert_eq!(f.cfg.api_style.as_deref(), Some("dashscope"));
-        f.cycle_style(-1);
-        assert_eq!(f.cfg.api_style.as_deref(), Some("openai"));
+    fn model_pick_follows_model_name() {
+        // 报文形状由模型名推断，不再手填
+        assert_eq!(
+            crate::asr::pick_style("qwen3-asr-flash", None).unwrap().name(),
+            "openai-compatible"
+        );
+        assert_eq!(
+            crate::asr::pick_style("qwen-audio-3.1-asr-flash-message", None).unwrap().name(),
+            "websocket"
+        );
     }
 
     #[test]
