@@ -49,13 +49,20 @@ impl Daemon {
     pub fn tick(&mut self) -> String {
         while let Ok(ev) = self.hk.try_recv() {
             match (ev, self.phase) {
-                (HotkeyEvent::Press, Phase::Idle) => match self.capture.start(self.cfg.max_seconds) {
+                (HotkeyEvent::Press, Phase::Idle) => {
+                    // 每次开录前重读配置：这样 `dictate settings` 保存后不用重启托盘进程
+                    //（热键本身除外，它在启动时就绑定了）。
+                    if let Ok(cfg) = crate::config::load() {
+                        self.cfg = cfg;
+                    }
+                    match self.capture.start(self.cfg.max_seconds) {
                     Ok(()) => {
                         self.phase = Phase::Recording(Instant::now());
                         self.last_error = None;
                     }
                     Err(e) => self.last_error = Some(format!("启动录音失败：{e}")),
-                },
+                    }
+                }
                 (HotkeyEvent::Release, Phase::Recording(_)) => match self.capture.stop() {
                     Ok((rate, pcm)) => {
                         let secs = pcm.len() as f32 / rate as f32;
