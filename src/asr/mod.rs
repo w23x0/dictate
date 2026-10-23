@@ -195,10 +195,27 @@ pub(crate) fn post_json(
     let status = resp.status();
     let text = resp.text().context("读响应体失败")?;
     if !status.is_success() {
-        let msg = error_message(&text).unwrap_or_else(|| text.chars().take(300).collect());
+        let msg = humanize_error(&text).unwrap_or_else(|| text.chars().take(300).collect());
         bail!("HTTP {status}：{msg}");
     }
     Ok(text)
+}
+
+/// 把服务端错误码翻成人话。
+pub fn humanize_error(body: &str) -> Option<String> {
+    let raw = error_message(body)?;
+    let hint = if raw.contains("ASR_RESPONSE_HAVE_NO_WORDS") {
+        "服务端没从音频里听出任何词（多半是静音或只有噪声）——检查麦克风，或先用 `dictate probe --seconds 3` 看电平"
+    } else if raw.contains("InvalidApiKey") || raw.contains("Unauthorized") {
+        "API key 不对，或与所在区域不匹配"
+    } else if raw.contains("Throttling") || raw.contains("429") {
+        "请求太频繁，稍后再试"
+    } else if raw.contains("ModelNotFound") || raw.contains("model not exist") {
+        "这个模型不存在或没有开通"
+    } else {
+        return Some(raw);
+    };
+    Some(format!("{hint}（原始：{raw}）"))
 }
 
 pub fn error_message(body: &str) -> Option<String> {
@@ -265,6 +282,14 @@ mod tests {
             client.http_endpoint(),
             "https://ws-x.cn-beijing.maas.aliyuncs.com/api-ws/v1/inference"
         );
+    }
+
+    #[test]
+    fn server_error_codes_are_explained() {
+        let body = r#"{"request_id":"x","code":"InvalidParameter","message":"generate asr words failed. ASR_RESPONSE_HAVE_NO_WORDS"}"#;
+        let msg = humanize_error(body).unwrap();
+        assert!(msg.contains("没从音频里听出任何词"), "{msg}");
+        assert!(msg.contains("ASR_RESPONSE_HAVE_NO_WORDS"), "要保留原始错误码");
     }
 
     #[test]

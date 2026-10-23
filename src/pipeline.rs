@@ -43,6 +43,13 @@ pub fn prepare_wav(cfg: &Config, pcm: &[f32], rate: u32) -> Result<Vec<u8>> {
     }
     let voiced = trimmed;
 
+    if cfg.keep_audio {
+        let keep = crate::config::status_path()
+            .parent()
+            .map(|d| d.join("last.wav"))
+            .unwrap_or_else(|| std::env::temp_dir().join("last.wav"));
+        audio::write_wav(&keep, &voiced).ok();
+    }
     let path = std::env::temp_dir().join(format!("dictate-{}.wav", new_id()));
     audio::write_wav(&path, &voiced)?;
     let bytes =

@@ -39,6 +39,8 @@ pub struct Config {
     pub color: Option<String>,
     /// 输入设备名（留空 = 系统默认）。`dictate devices` 可以列出来。
     pub input_device: Option<String>,
+    /// 把每次送到服务端的 WAV 留一份到 `~/.local/share/dictate/last.wav`。
+    pub keep_audio: bool,
 }
 
 impl Default for Config {
@@ -59,6 +61,7 @@ impl Default for Config {
             theme: None,
             color: None,
             input_device: None,
+            keep_audio: false,
         }
     }
 }
