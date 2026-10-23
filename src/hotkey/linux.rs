@@ -74,7 +74,7 @@ impl Mods {
     }
 }
 
-pub fn spawn(spec: Spec, tx: Sender<HotkeyEvent>) -> Result<()> {
+pub fn spawn(spec: Spec, tx: Sender<HotkeyEvent>, verbose: bool) -> Result<()> {
     let paths = device_paths();
     if paths.is_empty() {
         return Err(anyhow!("找不到 /dev/input/event*"));
@@ -96,8 +96,11 @@ pub fn spawn(spec: Spec, tx: Sender<HotkeyEvent>) -> Result<()> {
             continue;
         }
         opened += 1;
-        let name = dev.name().unwrap_or("?").to_string();
-        eprintln!("[hotkey] 监听 {name}（{}）", path.display());
+        // TUI 模式下绝不往 stderr 写：那会把画面撕开。
+        if verbose {
+            let name = dev.name().unwrap_or("?").to_string();
+            eprintln!("[hotkey] 监听 {name}（{}）", path.display());
+        }
         let tx = Arc::clone(&tx);
         std::thread::spawn(move || watch(dev, spec, tx));
     }

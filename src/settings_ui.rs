@@ -15,7 +15,19 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph};
 use ratatui::Terminal;
 
+use unicode_width::UnicodeWidthStr;
+
 use crate::config::{self, Config};
+
+/// 按**显示宽度**补齐（中文占两格），否则中英混排的列会歪。
+fn pad(s: &str, width: usize) -> String {
+    let w = UnicodeWidthStr::width(s);
+    if w >= width {
+        s.to_string()
+    } else {
+        format!("{s}{}", " ".repeat(width - w))
+    }
+}
 
 const FIELDS: [&str; 10] = [
     "服务地址",
@@ -272,8 +284,24 @@ fn event_loop(term: &mut Terminal<CrosstermBackend<std::io::Stdout>>, f: &mut Fo
 fn draw(fr: &mut ratatui::Frame, f: &Form) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(5), Constraint::Length(2)])
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Min(5),
+            Constraint::Length(2),
+        ])
         .split(fr.area());
+    fr.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled("◆ ", Style::default().fg(Color::Rgb(0x8b, 0x7d, 0xff))),
+            Span::styled("dictate", Style::default().add_modifier(Modifier::BOLD)),
+            Span::styled(
+                format!("  v{}", env!("CARGO_PKG_VERSION")),
+                Style::default().fg(Color::Rgb(0x3f, 0x44, 0x4d)),
+            ),
+            Span::styled("  ·  设置", Style::default().fg(Color::Rgb(0x6b, 0x72, 0x80))),
+        ])),
+        chunks[0],
+    );
 
     let items: Vec<ListItem> = FIELDS
         .iter()
@@ -286,8 +314,8 @@ fn draw(fr: &mut ratatui::Frame, f: &Form) {
             };
             ListItem::new(Line::from(vec![
                 Span::styled(
-                    format!("{:<18}", label),
-                    Style::default().fg(Color::DarkGray),
+                    pad(label, 24),
+                    Style::default().fg(Color::Rgb(0x6b, 0x72, 0x80)),
                 ),
                 Span::styled(value, Style::default()),
             ]))
@@ -297,10 +325,24 @@ fn draw(fr: &mut ratatui::Frame, f: &Form) {
     let mut state = ListState::default();
     state.select(Some(f.sel));
     let list = List::new(items)
-        .block(Block::default().borders(Borders::ALL).title("设置"))
-        .highlight_style(Style::default().bg(Color::DarkGray).add_modifier(Modifier::BOLD))
-        .highlight_symbol("› ");
-    fr.render_stateful_widget(list, chunks[0], &mut state);
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_type(ratatui::widgets::BorderType::Rounded)
+                .border_style(Style::default().fg(Color::Rgb(0x3f, 0x44, 0x4d)))
+                .title(Span::styled(
+                    " 设置 ",
+                    Style::default().fg(Color::Rgb(0x6b, 0x72, 0x80)),
+                ))
+                .padding(ratatui::widgets::Padding::horizontal(1)),
+        )
+        .highlight_style(
+            Style::default()
+                .bg(Color::Rgb(0x1f, 0x22, 0x2b))
+                .add_modifier(Modifier::BOLD),
+        )
+        .highlight_symbol("❯ ");
+    fr.render_stateful_widget(list, chunks[1], &mut state);
 
     let help =
         "↑↓ 选择   Enter 修改（编辑中 Ctrl+U 清空）   ←→ 切报文形状   s 保存   t 测试   q 退出";
@@ -311,10 +353,10 @@ fn draw(fr: &mut ratatui::Frame, f: &Form) {
     };
     fr.render_widget(
         Paragraph::new(vec![
-            Line::from(Span::styled(help, Style::default().fg(Color::DarkGray))),
-            Line::from(Span::styled(status, Style::default().fg(Color::Yellow))),
+            Line::from(Span::styled(help, Style::default().fg(Color::Rgb(0x3f, 0x44, 0x4d)))),
+            Line::from(Span::styled(status, Style::default().fg(Color::Rgb(0x34, 0xd3, 0x99)))),
         ]),
-        chunks[1],
+        chunks[2],
     );
 }
 

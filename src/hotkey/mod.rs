@@ -82,10 +82,10 @@ impl Spec {
 }
 
 /// 起监听线程；事件通过 `tx` 送出。返回的句柄被丢弃时线程仍继续（进程退出即结束）。
-pub fn spawn(spec: Spec, tx: Sender<HotkeyEvent>) -> Result<()> {
+pub fn spawn(spec: Spec, tx: Sender<HotkeyEvent>, verbose: bool) -> Result<()> {
     #[cfg(target_os = "linux")]
     {
-        linux::spawn(spec, tx)
+        linux::spawn(spec, tx, verbose)
     }
     #[cfg(windows)]
     {
@@ -93,7 +93,7 @@ pub fn spawn(spec: Spec, tx: Sender<HotkeyEvent>) -> Result<()> {
     }
     #[cfg(not(any(target_os = "linux", windows)))]
     {
-        let _ = (spec, tx);
+        let _ = (spec, tx, verbose);
         bail!("这个平台还没有热键实现")
     }
 }

@@ -490,6 +490,7 @@ dependencies = [
  "tokio-tungstenite",
  "toml",
  "tray-icon",
+ "unicode-width 0.2.0",
  "uuid",
  "windows-sys 0.59.0",
 ]

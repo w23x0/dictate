@@ -32,7 +32,7 @@ impl Daemon {
     pub fn new(cfg: Config) -> Result<Self> {
         let spec = hotkey::Spec::parse(&cfg.hotkey)?;
         let (tx, hk) = channel();
-        hotkey::spawn(spec, tx)?;
+        hotkey::spawn(spec, tx, true)?;
         let capture = crate::audio::spawn_capture()?;
         Ok(Self {
             cfg,
