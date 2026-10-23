@@ -379,8 +379,11 @@ fn event_loop(term: &mut Terminal<CrosstermBackend<std::io::Stdout>>, f: &mut Fo
                 f.cfg.enable_itn = !f.cfg.enable_itn;
                 f.dirty = true;
             }
+            // 中文输入法会拦裸字母，主命令用 F 键；字母只作别名
             KeyCode::Char('s') if plain => f.save()?,
+            KeyCode::F(2) => f.save()?,
             KeyCode::Char('t') if plain => f.run_test(),
+            KeyCode::F(3) => f.run_test(),
             _ => {}
         }
     }
@@ -490,6 +493,15 @@ fn draw(fr: &mut ratatui::Frame, f: &Form) {
         .highlight_symbol("❯ ");
     fr.render_stateful_widget(list, chunks[2], &mut state);
 
+    // 编辑中把光标显示在输入处：中文输入法的候选框是跟着**终端光标**走的，
+    // 光标藏起来的话 fcitx 只能瞎猜位置，于是候选框飘到屏幕外面。
+    if f.editing {
+        let row = chunks[2].y + f.sel as u16;
+        let prefix = 2 + 24 + unicode_width::UnicodeWidthStr::width(f.buf.as_str());
+        let max_x = chunks[2].x + chunks[2].width.saturating_sub(2);
+        fr.set_cursor_position((max_x.min(chunks[2].x + prefix as u16), row));
+    }
+
     // 底部面板
     let panel = chunks[3];
     fr.render_widget(Block::default().style(Style::default().bg(th.panel_bg)), panel);
@@ -515,7 +527,7 @@ fn draw(fr: &mut ratatui::Frame, f: &Form) {
     let hints = Rect { y: panel.y + 1, ..inner };
     fr.render_widget(
         Paragraph::new(Line::from(Span::styled(
-            "↑↓ 选择   ⏎ 修改/选择   ←→ 切换   s 保存   t 测试   q 退出",
+            "↑↓ 选择   ⏎ 修改/选择   F2 保存   F3 测试   Esc 退出",
             Style::default().fg(th.faint),
         )))
         .alignment(ratatui::layout::Alignment::Right)

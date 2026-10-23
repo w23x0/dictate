@@ -289,8 +289,28 @@ fn handle_key(app: &mut App, k: &crossterm::event::KeyEvent) -> Result<Outcome> 
                 app.selected += 1;
             }
         }
+        // 中文输入法会吃掉裸字母，所以主命令用非字母键；字母只作别名
         KeyCode::Char('q') if plain => return Ok(Outcome::Quit),
+        KeyCode::Delete => {
+            if let Some(e) = app.current() {
+                let id = e.id.clone();
+                app.history.delete(&id)?;
+                app.reload();
+                app.status = "已删除一条".into();
+            }
+        }
+        KeyCode::Char('f') if k.modifiers.contains(KeyModifiers::CONTROL) => {
+            app.searching = true;
+            app.query.clear();
+            app.refilter();
+        }
+        KeyCode::Char('l') if k.modifiers.contains(KeyModifiers::CONTROL) => {
+            app.history.clear()?;
+            app.reload();
+            app.status = "已清空".into();
+        }
         KeyCode::Char('s') if plain => return Ok(Outcome::Settings),
+        KeyCode::F(2) => return Ok(Outcome::Settings),
         KeyCode::Char(' ') => {
             // 手动录音：不依赖热键（托盘没起来时也能用）
             let recording = matches!(app.phase, Phase::Recording(_));
@@ -438,6 +458,15 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
         f.render_stateful_widget(list, list_area, &mut state);
     }
 
+    // 搜索时同样要把光标摆出来（输入法候选框跟着光标）
+    if app.searching {
+        // 面板在倒数第二块；光标放在 "/ 查询" 之后
+        let y = chunks[3].y;
+        let w = unicode_width::UnicodeWidthStr::width(app.query.as_str()) as u16;
+        let x = (chunks[3].x + 4 + w).min(area.width.saturating_sub(2));
+        f.set_cursor_position((x, y));
+    }
+
     // ── 底部面板：填充块（grok-cli 的输入框位置），不描边
     let panel = chunks[3];
     f.render_widget(
@@ -497,7 +526,7 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
     let hints = Rect { y: panel.y + 1, ..inner };
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
-            "空格 手动录音   s 设置   ↑↓ 选择   ⏎ 复制   / 搜索   d 删除   c 清空   q 退出",
+            "空格 录音   F2 设置   ↑↓ 选择   ⏎ 复制   Ctrl+F 搜索   Del 删除   Esc 退出",
             Style::default().fg(th.faint),
         )))
         .alignment(ratatui::layout::Alignment::Right)
