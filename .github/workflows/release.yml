@@ -4,6 +4,9 @@ on:
   push:
     tags: ["v*"]
 
+permissions:
+  contents: write
+
 jobs:
   build:
     # arm64 用 GitHub 原生 arm runner，交叉编译 GTK/ALSA 在本机跑不通
