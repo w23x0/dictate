@@ -52,6 +52,12 @@ fn run() -> Result<()> {
         "transcribe" => cmd_transcribe(&args[1..]),
         "record" => cmd_record(&args[1..]),
         "doctor" => cmd_doctor(),
+        "inject-test" => {
+            let text = args.get(1).cloned().unwrap_or_else(|| "dictate 测试".into());
+            let mode = inject::Mode::parse(args.get(2).map(|s| s.as_str()).unwrap_or("clipboard"));
+            println!("{}", inject::deliver(&text, mode)?);
+            Ok(())
+        }
         "install-desktop" => {
             desktop::ensure_installed()?;
             println!("已写入应用入口与图标（~/.local/share/applications、icons）");

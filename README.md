@@ -49,7 +49,7 @@ dictate doctor       # 不录音，验 key / 区域 / 模型 / 粘贴能力
 | `off` | 只进历史 |
 
 Wayland（GNOME）下没有 `wtype`/`ydotool` 时只能做到写剪贴板，程序会在状态里说明，按 `Ctrl+V` 即可。
-`dictate doctor` 会列出当前机器上有哪些工具。
+`dictate doctor` 会列出当前机器上有哪些工具；`dictate inject-test "文字"` 可以单独验证这条链路。
 
 ## 热键
 

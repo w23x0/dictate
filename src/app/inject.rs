@@ -62,6 +62,9 @@ pub fn deliver(text: &str, mode: Mode) -> Result<String> {
     let mut how = "已复制到剪贴板（按 Ctrl+V 粘贴）".to_string();
     if mode == Mode::Auto {
         match send_paste(wayland) {
+            Some("xdotool") if wayland => {
+                how = "已复制到剪贴板，并尝试过 xdotool（只对 XWayland 窗口有效）——没粘贴上就按 Ctrl+V".into()
+            }
             Some(tool) => how = format!("已粘贴（{tool}）"),
             None => {
                 how = if wayland {
