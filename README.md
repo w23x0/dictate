@@ -62,6 +62,22 @@ cargo run --release -- history                              # 终端历史窗口
 
 三种形状都有本地假服务端的端到端测试（真 socket），见 `src/asr/e2e.rs`。
 
+## 界面
+
+扁平布局（grok-cli 那种），没有边框盒子；底部是一个填充色面板，左上是品牌行：
+
+```
+◆ dictate  v0.1.0  ctrl+space · qwen3-asr-flash        ● 就绪   12 条
+
+ 20:31  ❯ 今天下午三点跟产品过一下这个需求，顺便把接口文档同步给后端。  1.8s
+ 20:28  ❯ 帮我把这段代码里的 unwrap 全部换成 anyhow 的 context。        0.9s
+
+  ❯ 按住热键说话
+                        ↑↓ 选择   ⏎ 复制   / 搜索   d 删除   c 清空   q 退出
+```
+
+配色跟随终端明暗（OSC 11 探测，可在设置里强制 dark/light）。
+
 ## 托盘 / 无终端
 
 ```bash

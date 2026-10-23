@@ -20,6 +20,8 @@ pub struct Theme {
     pub rec: Color,
     pub warn: Color,
     pub selected_bg: Color,
+    /// 底部输入面板的底色（grok-cli 那种"填充块"而不是描边）
+    pub panel_bg: Color,
 }
 
 impl Theme {
@@ -32,7 +34,8 @@ impl Theme {
             ok: Color::Rgb(0x34, 0xd3, 0x99),
             rec: Color::Rgb(0xf8, 0x71, 0x71),
             warn: Color::Rgb(0xfb, 0xbf, 0x24),
-            selected_bg: Color::Rgb(0x1f, 0x22, 0x2b),
+            selected_bg: Color::Rgb(0x26, 0x2a, 0x33),
+            panel_bg: Color::Rgb(0x1a, 0x1d, 0x23),
         }
     }
 
@@ -45,7 +48,8 @@ impl Theme {
             ok: Color::Rgb(0x15, 0x80, 0x3d),
             rec: Color::Rgb(0xb9, 0x1c, 0x1c),
             warn: Color::Rgb(0x9a, 0x5b, 0x00),
-            selected_bg: Color::Rgb(0xe4, 0xe6, 0xeb),
+            selected_bg: Color::Rgb(0xdf, 0xe3, 0xe8),
+            panel_bg: Color::Rgb(0xec, 0xee, 0xf1),
         }
     }
 

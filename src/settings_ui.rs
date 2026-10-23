@@ -12,7 +12,7 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph};
+use ratatui::widgets::{Block, List, ListItem, ListState, Paragraph};
 use ratatui::Terminal;
 
 use unicode_width::UnicodeWidthStr;
@@ -310,32 +310,36 @@ fn event_loop(term: &mut Terminal<CrosstermBackend<std::io::Stdout>>, f: &mut Fo
 }
 
 fn draw(fr: &mut ratatui::Frame, f: &Form) {
-    let theme = f.theme;
+    let th = f.theme;
+    use ratatui::layout::Rect;
+
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(1),
-            Constraint::Min(5),
-            Constraint::Length(2),
+            Constraint::Length(1), // 品牌
+            Constraint::Length(1), // 空行
+            Constraint::Min(3),    // 字段
+            Constraint::Length(2), // 面板
         ])
         .split(fr.area());
+
     fr.render_widget(
         Paragraph::new(Line::from(vec![
-            Span::styled("◆ ", Style::default().fg(theme.accent)),
+            Span::styled("◆ ", Style::default().fg(th.accent)),
             Span::styled("dictate", Style::default().add_modifier(Modifier::BOLD)),
             Span::styled(
                 format!("  v{}", env!("CARGO_PKG_VERSION")),
-                Style::default().fg(theme.faint),
+                Style::default().fg(th.faint),
             ),
             Span::styled(
                 format!(
                     "  ·  设置（{}）",
-                    match theme.mode {
+                    match th.mode {
                         Mode::Dark => "深色",
                         Mode::Light => "浅色",
                     }
                 ),
-                Style::default().fg(theme.dim),
+                Style::default().fg(th.dim),
             ),
         ])),
         chunks[0],
@@ -351,11 +355,7 @@ fn draw(fr: &mut ratatui::Frame, f: &Form) {
                 f.value(i)
             };
             ListItem::new(Line::from(vec![
-                Span::styled(
-                    pad(label, 24),
-                    Style::default().fg(theme.dim),
-                ),
-                Span::styled(value, Style::default()),
+                Span::styled(format!(" {}{}", pad(label, 24), value), Style::default()),
             ]))
         })
         .collect();
@@ -363,38 +363,41 @@ fn draw(fr: &mut ratatui::Frame, f: &Form) {
     let mut state = ListState::default();
     state.select(Some(f.sel));
     let list = List::new(items)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_type(ratatui::widgets::BorderType::Rounded)
-                .border_style(Style::default().fg(theme.faint))
-                .title(Span::styled(
-                    " 设置 ",
-                    Style::default().fg(theme.dim),
-                ))
-                .padding(ratatui::widgets::Padding::horizontal(1)),
-        )
-        .highlight_style(
-            Style::default()
-                .bg(theme.selected_bg)
-                .add_modifier(Modifier::BOLD),
-        )
+        .highlight_style(Style::default().bg(th.selected_bg).add_modifier(Modifier::BOLD))
         .highlight_symbol("❯ ");
-    fr.render_stateful_widget(list, chunks[1], &mut state);
+    fr.render_stateful_widget(list, chunks[2], &mut state);
 
-    let help =
-        "↑↓ 选择   Enter 修改（编辑中 Ctrl+U 清空）   ←→ 切报文形状   s 保存   t 测试   q 退出";
+    // 底部面板
+    let panel = chunks[3];
+    fr.render_widget(Block::default().style(Style::default().bg(th.panel_bg)), panel);
+    let inner = Rect {
+        x: panel.x + 2,
+        y: panel.y,
+        width: panel.width.saturating_sub(4),
+        height: 1,
+    };
     let status = if f.status.is_empty() {
         format!("配置文件：{}", config::config_path().display())
     } else {
         f.status.clone()
     };
     fr.render_widget(
-        Paragraph::new(vec![
-            Line::from(Span::styled(help, Style::default().fg(theme.faint))),
-            Line::from(Span::styled(status, Style::default().fg(theme.ok))),
-        ]),
-        chunks[2],
+        Paragraph::new(Line::from(vec![
+            Span::styled("❯ ", Style::default().fg(th.accent)),
+            Span::styled(status, Style::default().fg(th.dim)),
+        ]))
+        .style(Style::default().bg(th.panel_bg)),
+        inner,
+    );
+    let hints = Rect { y: panel.y + 1, ..inner };
+    fr.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            "↑↓ 选择   Enter 修改   ←→ 切换   s 保存   t 测试   q 退出",
+            Style::default().fg(th.faint),
+        )))
+        .alignment(ratatui::layout::Alignment::Right)
+        .style(Style::default().bg(th.panel_bg)),
+        hints,
     );
 }
 
