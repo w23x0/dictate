@@ -103,15 +103,26 @@ impl App {
 
     fn refilter(&mut self) {
         let q = self.query.to_lowercase();
+        // 倒序：**最新的一条在最上面**，选中项默认就是它
         self.shown = self
             .all
             .iter()
             .enumerate()
+            .rev()
             .filter(|(_, e)| q.is_empty() || e.text.to_lowercase().contains(&q))
             .map(|(i, _)| i)
             .collect();
         if self.selected >= self.shown.len() {
             self.selected = self.shown.len().saturating_sub(1);
+        }
+    }
+
+    /// 有新记录时：如果用户还停在最新那条，就跟着走；否则保持他正在看的位置。
+    fn reload_keep_position(&mut self) {
+        let was_newest = self.selected == 0;
+        self.reload();
+        if was_newest {
+            self.selected = 0;
         }
     }
 
@@ -127,11 +138,16 @@ pub fn osc52(text: &str) -> String {
     format!("\x1b]52;c;{b64}\x07")
 }
 
+/// `dictate history`：只读视图，但**实时**（轮询守护进程状态 + 历史文件）。
 pub fn run(history: History) -> Result<()> {
-    // 配色要问终端背景色，必须在 raw mode 之后问，否则回包会被回显
     with_terminal(|term| {
-        let theme = Theme::resolve(crate::config::load().ok().and_then(|c| c.theme).as_deref());
-        event_loop(term, &mut App::new(history, theme))
+        let cfg = crate::config::load().ok();
+        let theme = Theme::resolve(cfg.as_ref().and_then(|c| c.theme.as_deref()));
+        let mut app = App::new(history, theme);
+        if let Some(c) = cfg {
+            app.subtitle = format!("{} · {}", c.hotkey, c.model);
+        }
+        attach_loop(term, &mut app)
     })
 }
 
@@ -219,40 +235,31 @@ fn apply_status_from(path: &std::path::Path, app: &mut App) {
 
 /// 附着模式：只画，不抢热键/麦克风。
 fn attach_loop(term: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> Result<()> {
-    let mut last_len = usize::MAX;
+    let mut stamp = (0u64, 0u64);
     loop {
         if let Some(form) = app.settings.as_mut() {
             form.poll_test();
         }
         apply_status(app);
-        let len = std::fs::metadata(crate::config::history_path())
-            .map(|m| m.len() as usize)
-            .unwrap_or(0);
-        if len != last_len {
-            last_len = len;
-            app.reload();
+        let now = std::fs::metadata(crate::config::history_path())
+            .map(|m| {
+                use std::time::UNIX_EPOCH;
+                let t = m
+                    .modified()
+                    .ok()
+                    .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                    .map(|d| d.as_nanos() as u64)
+                    .unwrap_or(0);
+                (m.len(), t)
+            })
+            .unwrap_or((0, 0));
+        if now != stamp {
+            stamp = now;
+            app.reload_keep_position();
         }
         term.draw(|f| draw(f, app))?;
 
         if !event::poll(Duration::from_millis(100))? {
-            continue;
-        }
-        let Event::Key(k) = event::read()? else { continue };
-        if k.kind != KeyEventKind::Press {
-            continue;
-        }
-        match handle_key(app, &k)? {
-            Outcome::Continue => {}
-            Outcome::Quit => return Ok(()),
-        }
-    }
-}
-
-/// 只看历史（`dictate history`），不读状态文件。
-fn event_loop(term: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> Result<()> {
-    loop {
-        term.draw(|f| draw(f, app))?;
-        if !event::poll(Duration::from_millis(50))? {
             continue;
         }
         let Event::Key(k) = event::read()? else { continue };
@@ -333,7 +340,11 @@ fn handle_key(app: &mut App, k: &crossterm::event::KeyEvent) -> Result<Outcome> 
         }
         KeyCode::Backspace => {
             app.input.pop();
-            app.query = app.input.clone();
+            if app.input.starts_with('/') {
+                app.query.clear();
+            } else {
+                app.query = app.input.clone();
+            }
             app.refilter();
         }
         KeyCode::Up => app.selected = app.selected.saturating_sub(1),
@@ -346,6 +357,7 @@ fn handle_key(app: &mut App, k: &crossterm::event::KeyEvent) -> Result<Outcome> 
         KeyCode::PageDown => {
             app.selected = (app.selected + 10).min(app.shown.len().saturating_sub(1));
         }
+        // 列表是倒序的：Home = 最新，End = 最旧
         KeyCode::Home => app.selected = 0,
         KeyCode::End => app.selected = app.shown.len().saturating_sub(1),
         KeyCode::Delete => {
@@ -364,7 +376,12 @@ fn handle_key(app: &mut App, k: &crossterm::event::KeyEvent) -> Result<Outcome> 
         }
         KeyCode::Char(c) if !k.modifiers.contains(KeyModifiers::CONTROL) => {
             app.input.push(c);
-            app.query = app.input.clone();
+            // `/` 开头是命令，不拿去做过滤，否则打命令时列表会瞬间空掉
+            if app.input.starts_with('/') {
+                app.query.clear();
+            } else {
+                app.query = app.input.clone();
+            }
             app.refilter();
         }
         _ => {}
@@ -391,6 +408,8 @@ fn run_input(app: &mut App) -> Result<()> {
         app.input.clear();
         return Ok(());
     }
+    // 命令不参与过滤
+    app.query.clear();
 
     let mut parts = line.splitn(2, ' ');
     let cmd = parts.next().unwrap_or("");
