@@ -141,8 +141,7 @@ fn ws_server() -> (String, std::thread::JoinHandle<Vec<String>>) {
                 seen.push(t.to_string());
             }
             ws.send(tokio_tungstenite::tungstenite::Message::Text(
-                json!({"header":{"event":"task-started","task_id":"t"}})
-                    .to_string(),
+                json!({"header":{"event":"task-started","task_id":"t"}}).to_string(),
             ))
             .await
             .unwrap();
@@ -173,8 +172,7 @@ fn ws_server() -> (String, std::thread::JoinHandle<Vec<String>>) {
                 .unwrap();
             }
             ws.send(tokio_tungstenite::tungstenite::Message::Text(
-                json!({"header":{"event":"task-finished"}})
-                    .to_string(),
+                json!({"header":{"event":"task-finished"}}).to_string(),
             ))
             .await
             .unwrap();

@@ -2,8 +2,12 @@
 name = "dictate"
 version = "0.1.0"
 edition = "2021"
-description = "Qwen ASR 听写器：热键 → 采集 → 门 → AGC → 转写 → 历史（终端 TUI）"
+description = "按住热键说话，文字进当前窗口（通义千问 ASR + 托盘）"
 license = "MIT"
+readme = "README.md"
+repository = "https://github.com/OWNER/dictate"
+keywords = ["asr", "dictation", "speech-to-text", "qwen", "tray"]
+categories = ["command-line-utilities", "multimedia::audio"]
 
 [dependencies]
 anyhow = "1"

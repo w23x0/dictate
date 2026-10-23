@@ -53,7 +53,10 @@ fn run() -> Result<()> {
         "record" => cmd_record(&args[1..]),
         "doctor" => cmd_doctor(),
         "inject-test" => {
-            let text = args.get(1).cloned().unwrap_or_else(|| "dictate 测试".into());
+            let text = args
+                .get(1)
+                .cloned()
+                .unwrap_or_else(|| "dictate 测试".into());
             let mode = inject::Mode::parse(args.get(2).map(|s| s.as_str()).unwrap_or("clipboard"));
             println!("{}", inject::deliver(&text, mode)?);
             Ok(())
