@@ -10,7 +10,7 @@
 # 卸载：./uninstall.sh
 set -euo pipefail
 
-REPO="${DICTATE_REPO:-}"                       # 形如 owner/dictate
+REPO="${DICTATE_REPO:-w23x0/dictate}"                       # 形如 owner/dictate
 VERSION="${DICTATE_VERSION:-latest}"
 PREFIX="${DICTATE_PREFIX:-$HOME/.local}"
 BIN_DIR="$PREFIX/bin"

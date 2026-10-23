@@ -10,7 +10,7 @@
 ## 安装（一行）
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/<owner>/dictate/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/w23x0/dictate/main/install.sh | bash
 ```
 
 它会：装二进制到 `~/.local/bin/dictate`、写应用入口（能被应用搜索找到）、设置开机自启、后台起托盘。
@@ -18,7 +18,7 @@ curl -fsSL https://raw.githubusercontent.com/<owner>/dictate/main/install.sh | b
 从源码装：
 
 ```bash
-git clone https://github.com/<owner>/dictate && cd dictate && ./install.sh --local
+git clone https://github.com/w23x0/dictate && cd dictate && ./install.sh --local
 ```
 
 卸载：`./uninstall.sh`（加 `--purge` 连配置和历史一起删）。
