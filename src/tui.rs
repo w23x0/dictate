@@ -35,7 +35,6 @@ struct App {
     all: Vec<Entry>,
     shown: Vec<usize>,
     query: String,
-    searching: bool,
     selected: usize,
     status: String,
     phase: Phase,
@@ -43,9 +42,29 @@ struct App {
     subtitle: String,
     theme: Theme,
     overlay: Option<Overlay>,
-    /// 内嵌的设置页（F2 进入，Esc 退出）
+    /// 内嵌的设置页（`/settings` 进入，Esc 退出）
     settings: Option<crate::settings_ui::Form>,
+    /// 底部命令行（grok-cli 那种：始终可输入，`/` 开头是命令）
+    input: String,
+    quit_requested: bool,
 }
+
+/// 斜杠命令：名字、参数提示、说明
+const COMMANDS: &[(&str, &str, &str)] = &[
+    ("/settings", "", "打开设置"),
+    ("/model", "[名字]", "切换模型（不带参数则列表选）"),
+    ("/base", "[url]", "切换服务地址（不带参数则列表选）"),
+    ("/key", "[sk-…]", "设置 API key"),
+    ("/hotkey", "[组合键]", "设置热键，如 ctrl+space"),
+    ("/mode", "hold|toggle", "热键语义：按住说话 / 按一下开关"),
+    ("/record", "", "手动开始或停止录音"),
+    ("/search", "[文字]", "按内容过滤历史"),
+    ("/clear", "", "清空全部历史（需确认）"),
+    ("/refresh", "", "重新读历史文件"),
+    ("/help", "", "帮助"),
+    ("/quit", "", "退出视图（守护进程继续跑）"),
+    ("/daemon", "stop", "退出守护进程"),
+];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Overlay {
@@ -63,7 +82,6 @@ impl App {
             all: Vec::new(),
             shown: Vec::new(),
             query: String::new(),
-            searching: false,
             selected: 0,
             status: String::new(),
             phase: Phase::Idle,
@@ -71,6 +89,8 @@ impl App {
             theme,
             overlay: None,
             settings: None,
+            input: String::new(),
+            quit_requested: false,
         };
         app.reload();
         app
@@ -257,10 +277,7 @@ fn send_control(cmd: &str) {
     let _ = std::fs::write(&path, cmd);
 }
 
-/// 处理一个按键。
-///
-/// 键位规矩（和 grok-cli 一致）：**字母键一律不做命令**——中文输入法会把裸字母吃掉。
-/// 主键只用 Esc / Enter / 方向键 / Space / Del / F 键 / Ctrl+组合。
+/// 处理一个按键。模型和 grok-cli 一样：底部一行输入框，`/` 开头是命令。
 fn handle_key(app: &mut App, k: &crossterm::event::KeyEvent) -> Result<Outcome> {
     if let Some(form) = app.settings.as_mut() {
         if crate::settings_ui::handle_form_key(form, k)? {
@@ -269,12 +286,10 @@ fn handle_key(app: &mut App, k: &crossterm::event::KeyEvent) -> Result<Outcome> 
         }
         return Ok(Outcome::Continue);
     }
-    // 遮罩层优先
+
     if let Some(ov) = app.overlay {
         match ov {
-            Overlay::Help => {
-                app.overlay = None;
-            }
+            Overlay::Help => app.overlay = None,
             Overlay::ConfirmClear => match k.code {
                 KeyCode::Enter => {
                     app.history.clear()?;
@@ -298,39 +313,26 @@ fn handle_key(app: &mut App, k: &crossterm::event::KeyEvent) -> Result<Outcome> 
         return Ok(Outcome::Continue);
     }
 
-    if app.searching {
-        match k.code {
-            KeyCode::Esc => {
-                app.searching = false;
-                app.query.clear();
-                app.refilter();
-            }
-            KeyCode::Enter => app.searching = false,
-            KeyCode::Backspace => {
-                app.query.pop();
-                app.refilter();
-            }
-            KeyCode::Char(c) => {
-                app.query.push(c);
-                app.refilter();
-            }
-            _ => {}
-        }
-        return Ok(Outcome::Continue);
-    }
-
-    let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
     match k.code {
-        KeyCode::Esc => return Ok(Outcome::Quit),
-        KeyCode::F(10) => return Ok(Outcome::Quit),
-        KeyCode::F(1) => app.overlay = Some(Overlay::Help),
-        KeyCode::F(2) => {
-            let cfg = crate::config::load()?;
-            let mut form = crate::settings_ui::Form::new(cfg);
-            form.theme = app.theme;
-            app.settings = Some(form);
+        KeyCode::Esc => {
+            if app.input.is_empty() {
+                return Ok(Outcome::Quit);
+            }
+            app.input.clear();
+            app.query.clear();
+            app.refilter();
         }
-
+        KeyCode::Enter => {
+            run_input(app)?;
+            if app.quit_requested {
+                return Ok(Outcome::Quit);
+            }
+        }
+        KeyCode::Backspace => {
+            app.input.pop();
+            app.query = app.input.clone();
+            app.refilter();
+        }
         KeyCode::Up => app.selected = app.selected.saturating_sub(1),
         KeyCode::Down => {
             if app.selected + 1 < app.shown.len() {
@@ -343,14 +345,6 @@ fn handle_key(app: &mut App, k: &crossterm::event::KeyEvent) -> Result<Outcome> 
         }
         KeyCode::Home => app.selected = 0,
         KeyCode::End => app.selected = app.shown.len().saturating_sub(1),
-
-        KeyCode::Enter => {
-            if let Some(e) = app.current() {
-                let text = e.text.clone();
-                print!("{}", osc52(&text));
-                app.status = format!("已复制 {} 字", text.chars().count());
-            }
-        }
         KeyCode::Delete => {
             if let Some(e) = app.current() {
                 let id = e.id.clone();
@@ -359,29 +353,156 @@ fn handle_key(app: &mut App, k: &crossterm::event::KeyEvent) -> Result<Outcome> 
                 app.status = "已删除一条".into();
             }
         }
-        KeyCode::Char('f') if ctrl => {
-            app.searching = true;
-            app.query.clear();
+        KeyCode::Tab => {
+            // 补全：输入 `/` 后按 Tab 补第一个匹配的命令
+            if let Some((name, _, _)) = COMMANDS.iter().find(|(c, _, _)| c.starts_with(app.input.as_str()) && !app.input.is_empty()) {
+                app.input = (*name).to_string();
+            }
+        }
+        KeyCode::Char(c) if !k.modifiers.contains(KeyModifiers::CONTROL) => {
+            app.input.push(c);
+            app.query = app.input.clone();
             app.refilter();
-        }
-        KeyCode::Char('l') if ctrl => app.overlay = Some(Overlay::ConfirmClear),
-        KeyCode::Char('q') if ctrl => app.overlay = Some(Overlay::ConfirmQuitDaemon),
-        KeyCode::Char('r') if ctrl => {
-            app.reload();
-            app.status = "已刷新".into();
-        }
-        KeyCode::Char(' ') => {
-            let recording = matches!(app.phase, Phase::Recording(_));
-            send_control(if recording { "stop" } else { "start" });
-            app.status = if recording {
-                "已提交（手动停止）".into()
-            } else {
-                "手动开始录音…".into()
-            };
         }
         _ => {}
     }
     Ok(Outcome::Continue)
+}
+
+/// 回车：`/` 开头当命令，否则当作过滤词（输入时已经实时过滤）。
+fn run_input(app: &mut App) -> Result<()> {
+    let line = app.input.trim().to_string();
+    if line.is_empty() {
+        // 空输入按回车 = 复制选中记录（grok 里是"发送"，这里没有消息可发）
+        if let Some(e) = app.current() {
+            let text = e.text.clone();
+            print!("{}", osc52(&text));
+            app.status = format!("已复制 {} 字", text.chars().count());
+        }
+        return Ok(());
+    }
+    if !line.starts_with('/') {
+        app.query = line.clone();
+        app.refilter();
+        app.status = format!("筛选：{line}（Esc 清除）");
+        app.input.clear();
+        return Ok(());
+    }
+
+    let mut parts = line.splitn(2, ' ');
+    let cmd = parts.next().unwrap_or("");
+    let arg = parts.next().unwrap_or("").trim().to_string();
+    match cmd {
+        "/help" => app.overlay = Some(Overlay::Help),
+        "/settings" => {
+            let cfg = crate::config::load()?;
+            let mut form = crate::settings_ui::Form::new(cfg);
+            form.theme = app.theme;
+            app.settings = Some(form);
+        }
+        "/model" => {
+            if let Some(form) = app.settings.as_mut() {
+                let _ = form;
+            }
+            if arg.is_empty() {
+                let cfg = crate::config::load()?;
+                let mut form = crate::settings_ui::Form::new(cfg);
+                form.theme = app.theme;
+                form.open_model_picker();
+                app.settings = Some(form);
+            } else {
+                let mut cfg = crate::config::load()?;
+                if crate::asr::pick_style(&arg, None).is_err() {
+                    app.status = format!("{arg} 不支持（异步 filetrans 没做）");
+                } else {
+                    cfg.model = arg.clone();
+                    cfg.api_style = None;
+                    crate::config::write(&crate::config::config_path(), &cfg)?;
+                    app.status = format!("模型 → {arg}（下次录音生效）");
+                }
+            }
+        }
+        "/base" => {
+            if arg.is_empty() {
+                let cfg = crate::config::load()?;
+                let mut form = crate::settings_ui::Form::new(cfg);
+                form.theme = app.theme;
+                form.open_base_picker();
+                app.settings = Some(form);
+            } else {
+                let mut cfg = crate::config::load()?;
+                match crate::asr::normalize_base(&arg) {
+                    Ok(b) => {
+                        cfg.base_url = b;
+                        crate::config::write(&crate::config::config_path(), &cfg)?;
+                        app.status = format!("服务地址 → {}", cfg.base_url);
+                    }
+                    Err(e) => app.status = format!("地址不合法：{e}"),
+                }
+            }
+        }
+        "/key" => {
+            if arg.is_empty() {
+                app.status = "用法：/key sk-…".into();
+            } else {
+                let mut cfg = crate::config::load()?;
+                cfg.api_key = Some(arg);
+                crate::config::write(&crate::config::config_path(), &cfg)?;
+                app.status = "已保存 key（存在配置文件里，权限 600）".into();
+            }
+        }
+        "/hotkey" => {
+            match crate::hotkey::Spec::parse(&arg) {
+                Ok(_) => {
+                    let mut cfg = crate::config::load()?;
+                    cfg.hotkey = arg.clone();
+                    crate::config::write(&crate::config::config_path(), &cfg)?;
+                    app.status = format!("热键 → {arg}（重启 dictate 生效）");
+                }
+                Err(e) => app.status = format!("热键不合法：{e}"),
+            }
+        }
+        "/mode" => {
+            let m = arg.to_ascii_lowercase();
+            if m == "hold" || m == "toggle" {
+                let mut cfg = crate::config::load()?;
+                cfg.hotkey_mode = m.clone();
+                crate::config::write(&crate::config::config_path(), &cfg)?;
+                app.status = format!("热键模式 → {m}");
+            } else {
+                app.status = "用法：/mode hold|toggle".into();
+            }
+        }
+        "/record" => {
+            let recording = matches!(app.phase, Phase::Recording(_));
+            send_control(if recording { "stop" } else { "start" });
+            app.status = if recording { "已停止并提交".into() } else { "开始录音…".into() };
+        }
+        "/search" => {
+            app.query = arg.clone();
+            app.refilter();
+            app.status = if arg.is_empty() { "已清除筛选".into() } else { format!("筛选：{arg}") };
+        }
+        "/clear" => app.overlay = Some(Overlay::ConfirmClear),
+        "/refresh" => {
+            app.reload();
+            app.status = "已刷新".into();
+        }
+        "/daemon" => {
+            if arg == "stop" {
+                app.overlay = Some(Overlay::ConfirmQuitDaemon);
+            } else {
+                app.status = "用法：/daemon stop".into();
+            }
+        }
+        "/quit" => {
+            app.input.clear();
+            app.quit_requested = true;
+        }
+        other => app.status = format!("没有这个命令：{other}（/help）"),
+    }
+    app.input.clear();
+    Ok(())
 }
 
 fn draw(f: &mut ratatui::Frame, app: &App) {
@@ -396,27 +517,19 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(1), // 品牌
-            Constraint::Length(1), // 空行（grok 也留白）
-            Constraint::Min(3),    // 历史（无边框）
-            Constraint::Length(2), // 输入面板（填充块）
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Min(3),
+            Constraint::Length(2),
         ])
         .split(area);
 
-    // ── 顶栏
     let left = Line::from(vec![
         Span::styled("◆ ", Style::default().fg(th.accent)),
         Span::styled("dictate", Style::default().add_modifier(Modifier::BOLD)),
+        Span::styled(format!("  v{}", env!("CARGO_PKG_VERSION")), Style::default().fg(th.faint)),
         Span::styled(
-            format!("  v{}", env!("CARGO_PKG_VERSION")),
-            Style::default().fg(th.faint),
-        ),
-        Span::styled(
-            if app.subtitle.is_empty() {
-                String::new()
-            } else {
-                format!("  {}", app.subtitle)
-            },
+            if app.subtitle.is_empty() { String::new() } else { format!("  {}", app.subtitle) },
             Style::default().fg(th.dim),
         ),
     ]);
@@ -427,7 +540,10 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
     };
     let right = Line::from(vec![
         Span::styled(dot, Style::default().fg(dot_color)),
-        Span::styled(format!(" {phase_text}   {} 条 ", app.shown.len()), Style::default().fg(th.dim)),
+        Span::styled(
+            format!(" {phase_text}   {} 条 ", app.shown.len()),
+            Style::default().fg(th.dim),
+        ),
     ])
     .alignment(ratatui::layout::Alignment::Right);
     let wide = Layout::default()
@@ -437,7 +553,6 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
     f.render_widget(Paragraph::new(left), wide[0]);
     f.render_widget(Paragraph::new(right), wide[1]);
 
-    // ── 历史：平铺列表，没有边框
     let list_area = chunks[2];
     if app.shown.is_empty() {
         let msg = if app.query.is_empty() {
@@ -481,21 +596,9 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
         f.render_stateful_widget(list, list_area, &mut state);
     }
 
-    // 搜索时同样要把光标摆出来（输入法候选框跟着光标）
-    if app.searching {
-        // 面板在倒数第二块；光标放在 "/ 查询" 之后
-        let y = chunks[3].y;
-        let w = unicode_width::UnicodeWidthStr::width(app.query.as_str()) as u16;
-        let x = (chunks[3].x + 4 + w).min(area.width.saturating_sub(2));
-        f.set_cursor_position((x, y));
-    }
-
-    // ── 底部面板：填充块（grok-cli 的输入框位置），不描边
+    // 底部：真正的输入行（grok-cli 的位置），输入法光标就落在这里
     let panel = chunks[3];
-    f.render_widget(
-        Block::default().style(Style::default().bg(th.panel_bg)),
-        panel,
-    );
+    f.render_widget(Block::default().style(Style::default().bg(th.panel_bg)), panel);
     let inner = Rect {
         x: panel.x + 2,
         y: panel.y,
@@ -503,36 +606,49 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
         height: 1,
     };
 
-    let status = if app.searching {
-        Line::from(vec![
-            Span::styled("/ ", Style::default().fg(th.accent)),
-            Span::styled(app.query.clone(), Style::default().fg(Color::Reset)),
-            Span::styled("▏", Style::default().fg(th.accent)),
-        ])
+    f.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled("❯ ", Style::default().fg(th.accent)),
+            Span::styled(app.input.clone(), Style::default().fg(Color::Reset)),
+        ]))
+        .style(Style::default().bg(th.panel_bg)),
+        inner,
+    );
+    let w = unicode_width::UnicodeWidthStr::width(app.input.as_str()) as u16;
+    f.set_cursor_position(((inner.x + 2 + w).min(inner.x + inner.width - 1), inner.y));
+
+    let second = if app.input.starts_with('/') {
+        let hits: Vec<&(&str, &str, &str)> = COMMANDS
+            .iter()
+            .filter(|(c, _, _)| c.starts_with(app.input.as_str()))
+            .collect();
+        if hits.is_empty() {
+            Line::from(Span::styled("没有匹配的命令", Style::default().fg(th.faint)))
+        } else {
+            let mut spans = Vec::new();
+            for (name, arg, desc) in hits.iter().take(4) {
+                spans.push(Span::styled((*name).to_string(), Style::default().fg(th.accent)));
+                if !arg.is_empty() {
+                    spans.push(Span::styled(format!(" {arg}"), Style::default().fg(th.faint)));
+                }
+                spans.push(Span::styled(format!(" {desc}   "), Style::default().fg(th.dim)));
+            }
+            Line::from(spans)
+        }
+    } else if !app.status.is_empty() {
+        Line::from(Span::styled(app.status.clone(), Style::default().fg(th.dim)))
     } else {
         match app.phase {
-            Phase::Idle => Line::from(vec![
-                Span::styled("❯ ", Style::default().fg(th.accent)),
-                Span::styled(
-                    if app.status.is_empty() {
-                        if app.subtitle.is_empty() {
-                            "只读模式 · q 退出".to_string()
-                        } else {
-                            "按住热键说话".to_string()
-                        }
-                    } else {
-                        app.status.clone()
-                    },
-                    Style::default().fg(th.dim),
-                ),
-            ]),
+            Phase::Idle => Line::from(Span::styled(
+                "↑↓ 选择   ⏎ 复制选中   / 命令   Del 删除   Esc 退出",
+                Style::default().fg(th.faint),
+            )),
             Phase::Recording(t) => Line::from(vec![
                 Span::styled("● ", Style::default().fg(th.rec)),
                 Span::styled(
-                    format!("录音中 {:.1}s", t.elapsed().as_secs_f32()),
+                    format!("录音中 {:.1}s   松开提交", t.elapsed().as_secs_f32()),
                     Style::default().fg(th.rec).add_modifier(Modifier::BOLD),
                 ),
-                Span::styled("   松开提交", Style::default().fg(th.dim)),
             ]),
             Phase::Transcribing(t) => {
                 const FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -544,17 +660,9 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
             }
         }
     };
-    f.render_widget(Paragraph::new(status).style(Style::default().bg(th.panel_bg)), inner);
-
-    let hints = Rect { y: panel.y + 1, ..inner };
     f.render_widget(
-        Paragraph::new(Line::from(Span::styled(
-            "空格 录音   ⏎ 复制   Del 删除   Ctrl+F 搜索   F1 帮助   F2 设置   Esc 退出",
-            Style::default().fg(th.faint),
-        )))
-        .alignment(ratatui::layout::Alignment::Right)
-        .style(Style::default().bg(th.panel_bg)),
-        hints,
+        Paragraph::new(second).style(Style::default().bg(th.panel_bg)),
+        Rect { y: panel.y + 1, ..inner },
     );
 
     if let Some(ov) = app.overlay {
@@ -562,7 +670,6 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
     }
 }
 
-/// 帮助 / 确认：整屏卡片（终端里没有半透明，覆盖就是覆盖）
 fn draw_overlay(f: &mut ratatui::Frame, app: &App, ov: Overlay) {
     use ratatui::widgets::Clear;
     let th = app.theme;
@@ -632,6 +739,64 @@ mod tests {
         assert!(s.starts_with("\x1b]52;c;"));
         assert!(s.ends_with('\x07'));
         assert!(s.contains("5L2g5aW9"));
+    }
+
+    fn key(c: char) -> crossterm::event::KeyEvent {
+        crossterm::event::KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE)
+    }
+
+    fn app_with(tmp: &str) -> App {
+        std::fs::create_dir_all(tmp).unwrap();
+        let h = History::new(std::path::Path::new(tmp).join("history.jsonl"));
+        App::new(h, Theme::dark())
+    }
+
+    #[test]
+    fn typing_slash_opens_command_palette_state() {
+        let dir = std::env::temp_dir().join(format!("dictate-cli-{}", std::process::id()));
+        std::env::set_var("XDG_DATA_HOME", &dir);
+        let mut app = app_with(dir.join("dictate").to_str().unwrap());
+        handle_key(&mut app, &key('/')).unwrap();
+        assert_eq!(app.input, "/");
+        handle_key(&mut app, &key('s')).unwrap();
+        assert_eq!(app.input, "/s");
+        // 过滤后确实只剩 /settings、/search
+        let hits: Vec<_> = COMMANDS
+            .iter()
+            .filter(|(c, _, _)| c.starts_with(app.input.as_str()))
+            .map(|(c, _, _)| *c)
+            .collect();
+        assert_eq!(hits, vec!["/settings", "/search"]);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn enter_runs_settings_command() {
+        let dir = std::env::temp_dir().join(format!("dictate-cli2-{}", std::process::id()));
+        std::env::set_var("XDG_DATA_HOME", &dir);
+        let mut app = app_with(dir.join("dictate").to_str().unwrap());
+        for c in "/settings".chars() {
+            handle_key(&mut app, &key(c)).unwrap();
+        }
+        handle_key(&mut app, &crossterm::event::KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)).unwrap();
+        assert!(app.settings.is_some(), "/settings 应该打开设置页");
+        assert!(app.input.is_empty(), "提交后输入行清空");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn esc_clears_input_then_quits() {
+        let dir = std::env::temp_dir().join(format!("dictate-cli3-{}", std::process::id()));
+        std::env::set_var("XDG_DATA_HOME", &dir);
+        let mut app = app_with(dir.join("dictate").to_str().unwrap());
+        for c in "abc".chars() {
+            handle_key(&mut app, &key(c)).unwrap();
+        }
+        let esc = crossterm::event::KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+        assert!(matches!(handle_key(&mut app, &esc).unwrap(), Outcome::Continue));
+        assert!(app.input.is_empty());
+        assert!(matches!(handle_key(&mut app, &esc).unwrap(), Outcome::Quit));
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

@@ -264,6 +264,24 @@ impl Form {
         Ok(())
     }
 
+    pub fn open_model_picker(&mut self) {
+        self.picker = Some(Picker {
+            title: "选择模型",
+            items: MODELS,
+            sel: MODELS.iter().position(|(m, _)| *m == self.cfg.model).unwrap_or(0),
+            field: 1,
+        });
+    }
+
+    pub fn open_base_picker(&mut self) {
+        self.picker = Some(Picker {
+            title: "选择服务地址",
+            items: BASES,
+            sel: BASES.iter().position(|(u, _)| *u == self.cfg.base_url).unwrap_or(0),
+            field: 0,
+        });
+    }
+
     /// 收起测试结果（内嵌模式下由外层循环调用）。
     pub fn poll_test(&mut self) {
         if let Some(rx) = &self.test {
