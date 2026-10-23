@@ -42,16 +42,20 @@ cargo run --release -- history                              # 终端历史窗口
 
 ## 支持的模型
 
-只有一个：
+三种报文形状，按模型名自动选，也可用 `api_style` 强制（`openai` / `dashscope` / `ws`）：
 
-| 模型 | 接口 | 说明 |
-|---|---|---|
-| `qwen3-asr-flash` | `POST {base}/compatible-mode/v1/chat/completions` | 官方文档里唯一支持 OpenAI 兼容模式的 ASR 模型；10 MB / 5 分钟 |
+| 模型 | 形状 | 端点 | 备注 |
+|---|---|---|---|
+| `qwen3-asr-flash` | OpenAI 兼容 | `{base}/compatible-mode/v1/chat/completions` | 10 MB / 5 分钟 |
+| `qwen3-asr-flash`（`api_style="dashscope"`） | DashScope 同步 | `{base}/api/v1/services/aigc/multimodal-generation/generation` | 内容字段是 `{"audio": …}` |
+| `qwen-audio-3.1-asr-flash`、`qwen-audio-3.0-asr-flash` | DashScope 同步 | 同上 | 内容字段是 `{"type":"input_audio",…}`，带 `format`/`sample_rate`；2 GB / 5 分钟 |
+| `qwen-audio-3.1-asr-flash-message`、`qwen-audio-3.1-asr-flash-streaming`、`qwen3-asr-flash-realtime` | WebSocket | `wss://{host}/api-ws/v1/inference` | `run-task` → 二进制音频 → `finish-task`；只取最终句 |
+| `*-filetrans` | — | — | 只能走「上传 → 异步任务 → 轮询」，**没实现**，选到会直接报错 |
 
-配置里的 `model` 字段可以填别的名字，但**能不能跑取决于服务端是否接受同一种报文**：
-`qwen3-asr-flash-filetrans` 只走 DashScope 异步任务接口（形状完全不同，本项目不实现）；
-`qwen-audio-3.1-asr-flash` 是同步的，但走 DashScope 多模态端点，不保证兼容。
-填错的表现是 API 返回错误，会原样写进历史。用 `dictate doctor` 可以一次问清楚。
+`base_url` 填到主机即可（`https://dashscope.aliyuncs.com`、`https://{WorkspaceId}.cn-beijing.maas.aliyuncs.com`），
+带 `/compatible-mode/v1` 之类的尾巴会自动剥掉。
+
+三种形状都有本地假服务端的端到端测试（真 socket），见 `src/asr/e2e.rs`。
 
 ## 配置
 

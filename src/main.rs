@@ -78,6 +78,9 @@ fn cmd_doctor() -> Result<()> {
     println!("配置：{}", config::config_path().display());
     println!("端点：{}", cfg.endpoint());
     println!("模型：{}", cfg.model);
+    if let Ok(style) = asr::pick_style(&cfg.model, cfg.api_style.as_deref()) {
+        println!("报文形状：{}", style.name());
+    }
     println!(
         "区域 key：{}",
         match cfg.api_key() {

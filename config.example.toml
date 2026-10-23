@@ -11,6 +11,12 @@ model = "qwen3-asr-flash"
 # 逆文本规范化（数字、单位）。听写默认关。
 enable_itn = false
 
+# 报文形状：留空按模型名推断；可选 openai / dashscope / ws
+# api_style = "dashscope"
+
+# 热键
+hotkey = "ctrl+space"
+
 # key 也可以走环境变量 DASHSCOPE_API_KEY（优先）
 # api_key = "sk-…"
 

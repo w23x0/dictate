@@ -29,6 +29,8 @@ pub struct Config {
     pub timeout_secs: u64,
     /// 全局热键：`ctrl+space` / `f9` / `alt+shift+d`。
     pub hotkey: String,
+    /// 强制报文形状：`openai` / `dashscope` / `ws`；留空则按模型名推断。
+    pub api_style: Option<String>,
 }
 
 impl Default for Config {
@@ -44,6 +46,7 @@ impl Default for Config {
             max_seconds: 240.0,
             timeout_secs: 60,
             hotkey: "ctrl+space".into(),
+            api_style: None,
         }
     }
 }
