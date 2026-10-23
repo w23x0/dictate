@@ -98,7 +98,11 @@ fn run_tray() -> Result<()> {
         }
     };
     let cfg = config::load()?;
-    tray::run(cfg)
+    let res = tray::run(cfg);
+    if let Some(dir) = dirs::data_dir().map(|d| d.join("dictate")) {
+        std::fs::remove_file(dir.join("daemon.pid")).ok();
+    }
+    res
 }
 
 fn help() -> Result<()> {

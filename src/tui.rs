@@ -823,6 +823,33 @@ mod tests {
     }
 
     #[test]
+    fn newest_entry_is_first_and_selected() {
+        let dir = std::env::temp_dir().join(format!("dictate-order-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("history.jsonl");
+        let mut f = std::fs::File::create(&path).unwrap();
+        use std::io::Write;
+        for (id, text) in [("old", "第一条"), ("mid", "第二条"), ("new", "第三条")] {
+            writeln!(
+                f,
+                "{}",
+                serde_json::json!({
+                    "id": id, "ts": "2026-10-23T10:00:00+08:00",
+                    "duration_ms": 1000, "latency_ms": 10,
+                    "model": "qwen3-asr-flash", "status": "ok", "text": text
+                })
+            )
+            .unwrap();
+        }
+        let app = App::new(History::new(&path), Theme::dark());
+        assert_eq!(app.shown.len(), 3);
+        assert_eq!(app.selected, 0);
+        assert_eq!(app.all[app.shown[0]].id, "new", "最上面应该是最新一条");
+        assert_eq!(app.all[app.shown[2]].id, "old");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn status_file_maps_to_phases() {
         // 直接构造状态文件，验证相位映射（attach 模式的核心）
         let dir = std::env::temp_dir().join(format!("dictate-status-{}", std::process::id()));

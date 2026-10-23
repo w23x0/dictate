@@ -48,39 +48,40 @@ pub fn ensure_installed() -> Result<()> {
     Ok(())
 }
 
-/// 单实例锁：托盘常驻被点两次时，第二个进程直接退出。
+/// 单实例：用 pid 文件判断，避免 flock 在「上一个进程刚死」时的竞态。
 pub fn acquire_single_instance() -> Option<std::fs::File> {
+    if daemon_running() {
+        return None;
+    }
     let dir = dirs::data_dir()?.join("dictate");
     std::fs::create_dir_all(&dir).ok()?;
-    let file = std::fs::OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(false)
-        .open(dir.join("daemon.lock"))
-        .ok()?;
-    match file.try_lock() {
-        Ok(()) => Some(file),
-        Err(_) => None,
-    }
+    let path = dir.join("daemon.pid");
+    std::fs::write(&path, std::process::id().to_string()).ok()?;
+    std::fs::File::open(path).ok()
 }
 
-/// 终端模拟器的启动命令。优先用用户自己正在用的那个（`TERM_PROGRAM` / `TERMINAL`），
-/// 否则按常见顺序找——**不能**默认起 gnome-terminal，那会在别人的 Ghostty 之外再开一个窗口。
-/// 守护进程是否在跑（锁被别处持有）。
+/// 守护进程是否在跑（pid 文件里那个进程还活着，且确实是 dictate）。
 pub fn daemon_running() -> bool {
     let Some(dir) = dirs::data_dir().map(|d| d.join("dictate")) else {
         return false;
     };
-    let Ok(f) = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(dir.join("daemon.lock"))
-    else {
+    let Ok(pid) = std::fs::read_to_string(dir.join("daemon.pid")) else {
         return false;
     };
-    f.try_lock().is_err() // 拿不到锁 = 别人持有 = 在跑
+    let Ok(pid) = pid.trim().parse::<u32>() else {
+        return false;
+    };
+    if pid == std::process::id() {
+        return false;
+    }
+    let alive = std::path::Path::new(&format!("/proc/{pid}")).exists();
+    if !alive {
+        return false;
+    }
+    // 确认那个 pid 真的是 dictate（防 pid 复用）
+    std::fs::read(format!("/proc/{pid}/cmdline"))
+        .map(|c| String::from_utf8_lossy(&c).contains("dictate"))
+        .unwrap_or(false)
 }
 
 /// 后台拉起守护进程（新会话组，父进程退出也不影响它）。
