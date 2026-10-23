@@ -62,35 +62,45 @@ cargo run --release -- history                              # 终端历史窗口
 
 三种形状都有本地假服务端的端到端测试（真 socket），见 `src/asr/e2e.rs`。
 
-## 界面
+## 界面与键位
 
-扁平布局（grok-cli 那种），没有边框盒子；底部是一个填充色面板，左上是品牌行：
+扁平布局（grok-cli 那种），无边框；底部填充面板显示状态与提示。配色按终端背景色推导。
 
 ```
-◆ dictate  v0.1.0  ctrl+space · qwen3-asr-flash        ● 就绪   12 条
+◆ dictate  v0.1.0  ctrl+space · qwen3-asr-flash          ● 就绪   12 条
 
  20:31  ❯ 今天下午三点跟产品过一下这个需求，顺便把接口文档同步给后端。  1.8s
  20:28  ❯ 帮我把这段代码里的 unwrap 全部换成 anyhow 的 context。        0.9s
 
   ❯ 按住热键说话
-     空格 手动录音   s 设置   ↑↓ 选择   ⏎ 复制   / 搜索   d 删除   c 清空   q 退出
+         空格 录音   ⏎ 复制   Del 删除   Ctrl+F 搜索   F1 帮助   F2 设置   Esc 退出
 ```
 
-配色跟随终端明暗（OSC 11 探测，可在设置里强制 dark/light）。
+### 热键语义（配置 `hotkey_mode`）
 
-## 托盘 / 无终端
+| 值 | 行为 |
+|---|---|
+| `hold`（默认） | **按住**说话，松开提交；按一下就松（< 200 ms）视为误触，丢弃 |
+| `toggle` | 按一下开始，再按一下停止 |
 
-```bash
-dictate            # 常驻，托盘图标出现，热键全局可用
-```
+### 键位（全部非字母键——中文输入法不会吃掉）
 
-- 托盘菜单：**打开历史…** / **设置…** / **退出**（前两个优先用你当前在用的终端）
-- `dictate run` 会**附着**到这个守护进程（没有就自动拉起），热键/麦克风只在守护进程里，不会两个进程抢麦
-- 能出现在应用搜索里：首次运行写 `~/.local/share/applications/dictate.desktop` + 图标
-- 单实例：重复启动会直接提示「已经在跑了」并退出
-- **GNOME 需要 AppIndicator 扩展**才有托盘图标（Ubuntu 自带，但默认可能没启用）：
-  `gnome-extensions enable ubuntu-appindicators@ubuntu.com`
-- 托盘在 Linux 用 libayatana-appindicator（会有 deprecation 警告，正常）；Windows 用 tray-icon
+| 键 | 作用 |
+|---|---|
+| `空格` | 手动开始 / 停止录音（不依赖热键） |
+| `↑ ↓` / `PgUp PgDn` / `Home End` | 选择 |
+| `⏎` | 复制选中（OSC 52） |
+| `Del` | 删除选中 |
+| `Ctrl+F` | 搜索（`Esc` 取消，`⏎` 确认） |
+| `Ctrl+R` | 刷新 |
+| `Ctrl+L` | 清空全部（需确认） |
+| `Ctrl+Q` | 退出守护进程（需确认） |
+| `F1` | 帮助 |
+| `F2` | 设置（内嵌，`Esc` 返回） |
+| `Esc` / `F10` | 退出视图（守护进程继续跑） |
+
+设置页：`↑↓` 选行、`⏎` 编辑/打开选择器、`F2` 保存、`F3` 测试、`Esc` 返回。
+编辑时终端光标会真的显示出来——中文输入法的候选框跟着它走，不会飘到屏幕外。
 
 ## 配置
 

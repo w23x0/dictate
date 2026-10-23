@@ -42,6 +42,18 @@ struct App {
     /// 顶栏副标题（热键 · 模型），只在 run 模式有
     subtitle: String,
     theme: Theme,
+    overlay: Option<Overlay>,
+    /// 内嵌的设置页（F2 进入，Esc 退出）
+    settings: Option<crate::settings_ui::Form>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Overlay {
+    Help,
+    /// 清空历史
+    ConfirmClear,
+    /// 让守护进程退出
+    ConfirmQuitDaemon,
 }
 
 impl App {
@@ -57,6 +69,8 @@ impl App {
             phase: Phase::Idle,
             subtitle: String::new(),
             theme,
+            overlay: None,
+            settings: None,
         };
         app.reload();
         app
@@ -184,6 +198,9 @@ fn apply_status(app: &mut App) {
 fn attach_loop(term: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> Result<()> {
     let mut last_len = usize::MAX;
     loop {
+        if let Some(form) = app.settings.as_mut() {
+            form.poll_test();
+        }
         apply_status(app);
         let len = std::fs::metadata(crate::config::history_path())
             .map(|m| m.len() as usize)
@@ -204,11 +221,6 @@ fn attach_loop(term: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App)
         match handle_key(app, &k)? {
             Outcome::Continue => {}
             Outcome::Quit => return Ok(()),
-            Outcome::Settings => {
-                restore_term(term)?;
-                crate::settings_ui::run()?;
-                init_term(term)?;
-            }
         }
     }
 }
@@ -227,11 +239,6 @@ fn event_loop(term: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) 
         match handle_key(app, &k)? {
             Outcome::Continue => {}
             Outcome::Quit => return Ok(()),
-            Outcome::Settings => {
-                restore_term(term)?;
-                crate::settings_ui::run()?;
-                init_term(term)?;
-            }
         }
     }
 }
@@ -239,7 +246,6 @@ fn event_loop(term: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) 
 enum Outcome {
     Continue,
     Quit,
-    Settings,
 }
 
 /// 给守护进程递一条命令（它每 100 ms 读一次）。
@@ -252,7 +258,46 @@ fn send_control(cmd: &str) {
 }
 
 /// 处理一个按键。
+///
+/// 键位规矩（和 grok-cli 一致）：**字母键一律不做命令**——中文输入法会把裸字母吃掉。
+/// 主键只用 Esc / Enter / 方向键 / Space / Del / F 键 / Ctrl+组合。
 fn handle_key(app: &mut App, k: &crossterm::event::KeyEvent) -> Result<Outcome> {
+    if let Some(form) = app.settings.as_mut() {
+        if crate::settings_ui::handle_form_key(form, k)? {
+            app.settings = None;
+            app.reload();
+        }
+        return Ok(Outcome::Continue);
+    }
+    // 遮罩层优先
+    if let Some(ov) = app.overlay {
+        match ov {
+            Overlay::Help => {
+                app.overlay = None;
+            }
+            Overlay::ConfirmClear => match k.code {
+                KeyCode::Enter => {
+                    app.history.clear()?;
+                    app.reload();
+                    app.status = "已清空".into();
+                    app.overlay = None;
+                }
+                KeyCode::Esc => app.overlay = None,
+                _ => {}
+            },
+            Overlay::ConfirmQuitDaemon => match k.code {
+                KeyCode::Enter => {
+                    send_control("quit");
+                    app.status = "已通知守护进程退出".into();
+                    app.overlay = None;
+                }
+                KeyCode::Esc => app.overlay = None,
+                _ => {}
+            },
+        }
+        return Ok(Outcome::Continue);
+    }
+
     if app.searching {
         match k.code {
             KeyCode::Esc => {
@@ -273,24 +318,39 @@ fn handle_key(app: &mut App, k: &crossterm::event::KeyEvent) -> Result<Outcome> 
         }
         return Ok(Outcome::Continue);
     }
-    // 带修饰键的按键一律不当作动作：Ctrl+D 是终端 EOF、Ctrl+C 是中断
-    let plain = k.modifiers.is_empty() || k.modifiers == KeyModifiers::SHIFT;
-    if k.modifiers.contains(KeyModifiers::CONTROL) {
-        match k.code {
-            KeyCode::Char('c') | KeyCode::Char('d') => return Ok(Outcome::Quit),
-            _ => return Ok(Outcome::Continue),
-        }
-    }
+
+    let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
     match k.code {
         KeyCode::Esc => return Ok(Outcome::Quit),
+        KeyCode::F(10) => return Ok(Outcome::Quit),
+        KeyCode::F(1) => app.overlay = Some(Overlay::Help),
+        KeyCode::F(2) => {
+            let cfg = crate::config::load()?;
+            let mut form = crate::settings_ui::Form::new(cfg);
+            form.theme = app.theme;
+            app.settings = Some(form);
+        }
+
         KeyCode::Up => app.selected = app.selected.saturating_sub(1),
         KeyCode::Down => {
             if app.selected + 1 < app.shown.len() {
                 app.selected += 1;
             }
         }
-        // 中文输入法会吃掉裸字母，所以主命令用非字母键；字母只作别名
-        KeyCode::Char('q') if plain => return Ok(Outcome::Quit),
+        KeyCode::PageUp => app.selected = app.selected.saturating_sub(10),
+        KeyCode::PageDown => {
+            app.selected = (app.selected + 10).min(app.shown.len().saturating_sub(1));
+        }
+        KeyCode::Home => app.selected = 0,
+        KeyCode::End => app.selected = app.shown.len().saturating_sub(1),
+
+        KeyCode::Enter => {
+            if let Some(e) = app.current() {
+                let text = e.text.clone();
+                print!("{}", osc52(&text));
+                app.status = format!("已复制 {} 字", text.chars().count());
+            }
+        }
         KeyCode::Delete => {
             if let Some(e) = app.current() {
                 let id = e.id.clone();
@@ -299,20 +359,18 @@ fn handle_key(app: &mut App, k: &crossterm::event::KeyEvent) -> Result<Outcome> 
                 app.status = "已删除一条".into();
             }
         }
-        KeyCode::Char('f') if k.modifiers.contains(KeyModifiers::CONTROL) => {
+        KeyCode::Char('f') if ctrl => {
             app.searching = true;
             app.query.clear();
             app.refilter();
         }
-        KeyCode::Char('l') if k.modifiers.contains(KeyModifiers::CONTROL) => {
-            app.history.clear()?;
+        KeyCode::Char('l') if ctrl => app.overlay = Some(Overlay::ConfirmClear),
+        KeyCode::Char('q') if ctrl => app.overlay = Some(Overlay::ConfirmQuitDaemon),
+        KeyCode::Char('r') if ctrl => {
             app.reload();
-            app.status = "已清空".into();
+            app.status = "已刷新".into();
         }
-        KeyCode::Char('s') if plain => return Ok(Outcome::Settings),
-        KeyCode::F(2) => return Ok(Outcome::Settings),
         KeyCode::Char(' ') => {
-            // 手动录音：不依赖热键（托盘没起来时也能用）
             let recording = matches!(app.phase, Phase::Recording(_));
             send_control(if recording { "stop" } else { "start" });
             app.status = if recording {
@@ -321,51 +379,16 @@ fn handle_key(app: &mut App, k: &crossterm::event::KeyEvent) -> Result<Outcome> 
                 "手动开始录音…".into()
             };
         }
-        KeyCode::Char('x') if plain => {
-            send_control("quit");
-            app.status = "已通知守护进程退出".into();
-        }
-        KeyCode::Char('k') if plain => app.selected = app.selected.saturating_sub(1),
-        KeyCode::Char('j') if plain => {
-            if app.selected + 1 < app.shown.len() {
-                app.selected += 1;
-            }
-        }
-        KeyCode::Char('/') if plain => {
-            app.searching = true;
-            app.query.clear();
-            app.refilter();
-        }
-        KeyCode::Enter => {
-            if let Some(e) = app.current() {
-                let text = e.text.clone();
-                print!("{}", osc52(&text));
-                app.status = format!("已复制 {} 字", text.chars().count());
-            }
-        }
-        KeyCode::Char('d') if plain => {
-            if let Some(e) = app.current() {
-                let id = e.id.clone();
-                app.history.delete(&id)?;
-                app.reload();
-                app.status = "已删除一条".into();
-            }
-        }
-        KeyCode::Char('c') if plain => {
-            app.history.clear()?;
-            app.reload();
-            app.status = "已清空".into();
-        }
-        KeyCode::Char('r') if plain => {
-            app.reload();
-            app.status = "已刷新".into();
-        }
         _ => {}
     }
     Ok(Outcome::Continue)
 }
 
 fn draw(f: &mut ratatui::Frame, app: &App) {
+    if let Some(form) = &app.settings {
+        crate::settings_ui::draw_form(f, form);
+        return;
+    }
     let th = app.theme;
     use ratatui::layout::Rect;
 
@@ -526,12 +549,76 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
     let hints = Rect { y: panel.y + 1, ..inner };
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
-            "空格 录音   F2 设置   ↑↓ 选择   ⏎ 复制   Ctrl+F 搜索   Del 删除   Esc 退出",
+            "空格 录音   ⏎ 复制   Del 删除   Ctrl+F 搜索   F1 帮助   F2 设置   Esc 退出",
             Style::default().fg(th.faint),
         )))
         .alignment(ratatui::layout::Alignment::Right)
         .style(Style::default().bg(th.panel_bg)),
         hints,
+    );
+
+    if let Some(ov) = app.overlay {
+        draw_overlay(f, app, ov);
+    }
+}
+
+/// 帮助 / 确认：整屏卡片（终端里没有半透明，覆盖就是覆盖）
+fn draw_overlay(f: &mut ratatui::Frame, app: &App, ov: Overlay) {
+    use ratatui::widgets::Clear;
+    let th = app.theme;
+    let area = f.area();
+    let lines: Vec<Line> = match ov {
+        Overlay::Help => vec![
+            Line::from(vec![
+                Span::styled("◆ ", Style::default().fg(th.accent)),
+                Span::styled("dictate 帮助", Style::default().add_modifier(Modifier::BOLD)),
+            ]),
+            Line::from(""),
+            Line::from(Span::styled(format!("  热键：{}", app.subtitle), Style::default().fg(th.dim))),
+            Line::from(Span::styled("       按住说话（配置 hotkey_mode = hold）", Style::default().fg(th.dim))),
+            Line::from(Span::styled("       或按一下开、再按一下停（toggle）", Style::default().fg(th.dim))),
+            Line::from(""),
+            Line::from("  空格      手动开始 / 停止录音"),
+            Line::from("  ⏎         复制选中记录（OSC 52）"),
+            Line::from("  Del       删除选中记录"),
+            Line::from("  Ctrl+F    搜索          Ctrl+R  刷新"),
+            Line::from("  Ctrl+L    清空全部（需确认）"),
+            Line::from("  F2        设置          F1      本页"),
+            Line::from("  Ctrl+Q    退出守护进程（需确认）"),
+            Line::from("  Esc/F10   退出这个视图（守护进程继续跑）"),
+            Line::from(""),
+            Line::from(Span::styled("  任意键关闭", Style::default().fg(th.faint))),
+        ],
+        Overlay::ConfirmClear => vec![
+            Line::from(Span::styled("清空全部历史？", Style::default().add_modifier(Modifier::BOLD))),
+            Line::from(""),
+            Line::from(Span::styled("回车确认，Esc 取消", Style::default().fg(th.dim))),
+        ],
+        Overlay::ConfirmQuitDaemon => vec![
+            Line::from(Span::styled("退出守护进程？", Style::default().add_modifier(Modifier::BOLD))),
+            Line::from(""),
+            Line::from(Span::styled("托盘图标会消失、热键失效。回车确认，Esc 取消", Style::default().fg(th.dim))),
+        ],
+    };
+
+    let w = lines.iter().map(|l| l.width() as u16).max().unwrap_or(30) + 6;
+    let h = lines.len() as u16 + 2;
+    let rect = ratatui::layout::Rect {
+        x: area.x + area.width.saturating_sub(w) / 2,
+        y: area.y + area.height.saturating_sub(h) / 2,
+        width: w.min(area.width),
+        height: h.min(area.height),
+    };
+    f.render_widget(Clear, rect);
+    f.render_widget(
+        Paragraph::new(lines)
+            .style(Style::default().bg(th.panel_bg))
+            .block(
+                Block::default()
+                    .style(Style::default().bg(th.panel_bg))
+                    .border_style(Style::default().fg(th.faint)),
+            ),
+        rect,
     );
 }
 

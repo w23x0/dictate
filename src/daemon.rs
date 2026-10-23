@@ -25,6 +25,8 @@ pub struct Daemon {
     hk: Receiver<HotkeyEvent>,
     worker: (Sender<Result<String, String>>, Receiver<Result<String, String>>),
     pub phase: Phase,
+    /// 本次录音的开始时刻（判断"误触"用）
+    started: Option<Instant>,
     pub quit: bool,
     pub last_error: Option<String>,
     pub last_text: Option<String>,
@@ -43,6 +45,7 @@ impl Daemon {
             hk,
             worker: channel(),
             phase: Phase::Idle,
+            started: None,
             quit: false,
             last_error: None,
             last_text: None,
@@ -84,10 +87,21 @@ impl Daemon {
         }
         match self.capture.start(self.cfg.max_seconds) {
             Ok(()) => {
+                self.started = Some(Instant::now());
                 self.phase = Phase::Recording(Instant::now());
                 self.last_error = None;
             }
             Err(e) => self.last_error = Some(format!("启动录音失败：{e}")),
+        }
+    }
+
+    /// 取消本次录音（不转写）。
+    pub fn cancel(&mut self) {
+        if matches!(self.phase, Phase::Recording(_)) {
+            let _ = self.capture.stop();
+            self.phase = Phase::Idle;
+            self.started = None;
+            self.last_error = None;
         }
     }
 
@@ -96,6 +110,14 @@ impl Daemon {
         if !matches!(self.phase, Phase::Recording(_)) {
             return;
         }
+        // 误触：按一下就松（< 200 ms）直接丢弃，免得每次点错都产生一条空记录
+        let elapsed = self.started.map(|t| t.elapsed()).unwrap_or_default();
+        if elapsed < std::time::Duration::from_millis(200) {
+            self.cancel();
+            self.last_error = Some("按键太短，已忽略".into());
+            return;
+        }
+        self.started = None;
         match self.capture.stop() {
             Ok((rate, pcm)) => {
                 let secs = pcm.len() as f32 / rate as f32;
@@ -136,7 +158,10 @@ impl Daemon {
     pub fn tick(&mut self) -> String {
         self.poll_control();
         while let Ok(ev) = self.hk.try_recv() {
+            let toggle = self.cfg.hotkey_mode.eq_ignore_ascii_case("toggle");
             match (ev, self.phase) {
+                (HotkeyEvent::Press, Phase::Recording(_)) if toggle => self.stop(),
+                (HotkeyEvent::Release, _) if toggle => {}
                 (HotkeyEvent::Press, Phase::Idle) => {
                     // 每次开录前重读配置：这样 `dictate settings` 保存后不用重启托盘进程
                     //（热键本身除外，它在启动时就绑定了）。

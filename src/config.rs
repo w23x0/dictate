@@ -29,6 +29,8 @@ pub struct Config {
     pub timeout_secs: u64,
     /// 全局热键：`ctrl+space` / `f9` / `alt+shift+d`。
     pub hotkey: String,
+    /// 热键语义：`hold`（按住说话，默认）或 `toggle`（按一下开、再按一下停）。
+    pub hotkey_mode: String,
     /// 强制报文形状：`openai` / `dashscope` / `ws`；留空则按模型名推断。
     pub api_style: Option<String>,
     /// 配色：`auto`（默认，问终端）/ `dark` / `light`。
@@ -50,6 +52,7 @@ impl Default for Config {
             max_seconds: 240.0,
             timeout_secs: 60,
             hotkey: "ctrl+space".into(),
+            hotkey_mode: "hold".into(),
             api_style: None,
             theme: None,
             color: None,

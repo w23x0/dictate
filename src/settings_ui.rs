@@ -45,7 +45,7 @@ const BASES: &[(&str, &str)] = &[
     ("https://dashscope-intl.aliyuncs.com", "新加坡"),
 ];
 
-const FIELDS: [&str; 11] = [
+const FIELDS: [&str; 12] = [
     "服务地址",
     "模型",
     "报文形状",
@@ -53,13 +53,14 @@ const FIELDS: [&str; 11] = [
     "语言",
     "ITN（数字规范化）",
     "热键",
+    "热键模式",
     "静音自动结束 (ms)",
     "单次上限 (s)",
     "超时 (s)",
     "配色 (auto/dark/light)",
 ];
 
-struct Form {
+pub struct Form {
     cfg: Config,
     sel: usize,
     editing: bool,
@@ -67,7 +68,7 @@ struct Form {
     status: String,
     dirty: bool,
     test: Option<Receiver<Result<(u64, String), String>>>,
-    theme: Theme,
+    pub theme: Theme,
     picker: Option<Picker>,
 }
 
@@ -79,7 +80,7 @@ struct Picker {
 }
 
 impl Form {
-    fn new(cfg: Config) -> Self {
+    pub fn new(cfg: Config) -> Self {
         Self {
             cfg,
             sel: 0,
@@ -117,10 +118,15 @@ impl Form {
             4 => self.cfg.language.clone().unwrap_or_else(|| "auto".into()),
             5 => if self.cfg.enable_itn { "开" } else { "关" }.into(),
             6 => self.cfg.hotkey.clone(),
-            7 => self.cfg.silence_stop_ms.to_string(),
-            8 => format!("{}", self.cfg.max_seconds),
-            9 => self.cfg.timeout_secs.to_string(),
-            10 => self
+            7 => if self.cfg.hotkey_mode.eq_ignore_ascii_case("toggle") {
+                "toggle（按一下开、再按一下停）".into()
+            } else {
+                "hold（按住说话）".into()
+            },
+            8 => self.cfg.silence_stop_ms.to_string(),
+            9 => format!("{}", self.cfg.max_seconds),
+            10 => self.cfg.timeout_secs.to_string(),
+            11 => self
                 .cfg
                 .theme
                 .clone()
@@ -148,8 +154,14 @@ impl Form {
             self.dirty = true;
             return;
         }
-        if i == 10 {
+        if i == 11 {
             self.cycle_theme(1);
+            return;
+        }
+        if i == 7 {
+            let toggle = self.cfg.hotkey_mode.eq_ignore_ascii_case("toggle");
+            self.cfg.hotkey_mode = if toggle { "hold".into() } else { "toggle".into() };
+            self.dirty = true;
             return;
         }
         if i == 1 {
@@ -189,9 +201,10 @@ impl Form {
             3 => self.cfg.api_key.clone().unwrap_or_default(),
             4 => self.cfg.language.clone().unwrap_or_default(),
             6 => self.cfg.hotkey.clone(),
-            7 => self.cfg.silence_stop_ms.to_string(),
-            8 => format!("{}", self.cfg.max_seconds),
-            9 => self.cfg.timeout_secs.to_string(),
+            7 => self.cfg.hotkey_mode.clone(),
+            8 => self.cfg.silence_stop_ms.to_string(),
+            9 => format!("{}", self.cfg.max_seconds),
+            10 => self.cfg.timeout_secs.to_string(),
             _ => String::new(),
         };
     }
@@ -218,9 +231,16 @@ impl Form {
                     crate::hotkey::Spec::parse(&v)?;
                     self.cfg.hotkey = v.clone();
                 }
-                7 => self.cfg.silence_stop_ms = v.parse().map_err(|_| anyhow::anyhow!("要是整数 ms"))?,
-                8 => self.cfg.max_seconds = v.parse().map_err(|_| anyhow::anyhow!("要是数字秒"))?,
-                9 => self.cfg.timeout_secs = v.parse().map_err(|_| anyhow::anyhow!("要是整数秒"))?,
+                7 => {
+                    if v.eq_ignore_ascii_case("toggle") || v.eq_ignore_ascii_case("hold") {
+                        self.cfg.hotkey_mode = v.to_lowercase();
+                    } else {
+                        anyhow::bail!("只能是 hold 或 toggle");
+                    }
+                }
+                8 => self.cfg.silence_stop_ms = v.parse().map_err(|_| anyhow::anyhow!("要是整数 ms"))?,
+                9 => self.cfg.max_seconds = v.parse().map_err(|_| anyhow::anyhow!("要是数字秒"))?,
+                10 => self.cfg.timeout_secs = v.parse().map_err(|_| anyhow::anyhow!("要是整数秒"))?,
                 _ => {}
             }
             Ok(())
@@ -242,6 +262,19 @@ impl Form {
         self.dirty = false;
         self.status = format!("已保存到 {}", path.display());
         Ok(())
+    }
+
+    /// 收起测试结果（内嵌模式下由外层循环调用）。
+    pub fn poll_test(&mut self) {
+        if let Some(rx) = &self.test {
+            if let Ok(res) = rx.try_recv() {
+                self.status = match res {
+                    Ok((ms, text)) => format!("测试通过（{ms} ms）：{text:?}"),
+                    Err(e) => format!("测试失败：{e}"),
+                };
+                self.test = None;
+            }
+        }
     }
 
     fn run_test(&mut self) {
@@ -303,90 +336,91 @@ fn event_loop(term: &mut Terminal<CrosstermBackend<std::io::Stdout>>, f: &mut Fo
         if k.kind != KeyEventKind::Press {
             continue;
         }
-
-        if f.picker.is_some() {
-            if k.code == KeyCode::Char('q') {
-                return Ok(());
-            }
-        }
-        if let Some(p) = f.picker.as_mut() {
-            match k.code {
-                KeyCode::Esc => f.picker = None,
-                KeyCode::Up | KeyCode::Char('k') => p.sel = p.sel.saturating_sub(1),
-                KeyCode::Down | KeyCode::Char('j') => {
-                    if p.sel + 1 < p.items.len() {
-                        p.sel += 1;
-                    }
-                }
-                KeyCode::Enter => {
-                    let chosen = p.items[p.sel].0;
-                    let field = p.field;
-                    if field == 0 {
-                        f.cfg.base_url = chosen.to_string();
-                    } else {
-                        f.cfg.model = chosen.to_string();
-                        f.cfg.api_style = None; // 形状跟着模型自动选
-                    }
-                    f.dirty = true;
-                    f.picker = None;
-                    f.status = format!("已选择 {chosen}（按 s 保存）");
-                }
-                _ => {}
-            }
-            continue;
-        }
-
-        if f.editing {
-            match k.code {
-                KeyCode::Esc => {
-                    f.editing = false;
-                    f.status = "已取消".into();
-                }
-                KeyCode::Enter => f.commit_edit(),
-                KeyCode::Char('u') if k.modifiers.contains(KeyModifiers::CONTROL) => {
-                    f.buf.clear()
-                }
-                KeyCode::Backspace => {
-                    f.buf.pop();
-                }
-                KeyCode::Char(c) => f.buf.push(c),
-                _ => {}
-            }
-            continue;
-        }
-
-        let plain = k.modifiers.is_empty() || k.modifiers == KeyModifiers::SHIFT;
-        match k.code {
-            KeyCode::Esc => return Ok(()),
-            KeyCode::Char('q') if plain => {
-                if f.dirty {
-                    f.status = "有未保存的修改：按 s 保存，或再按 q 放弃".into();
-                    f.dirty = false;
-                } else {
-                    return Ok(());
-                }
-            }
-            KeyCode::Up | KeyCode::Char('k') if plain => f.sel = f.sel.saturating_sub(1),
-            KeyCode::Down | KeyCode::Char('j') if plain => {
-                if f.sel + 1 < FIELDS.len() {
-                    f.sel += 1;
-                }
-            }
-            KeyCode::Enter => f.start_edit(),
-            KeyCode::Left if f.sel == 10 => f.cycle_theme(-1),
-            KeyCode::Right if f.sel == 10 => f.cycle_theme(1),
-            KeyCode::Char(' ') if f.sel == 5 => {
-                f.cfg.enable_itn = !f.cfg.enable_itn;
-                f.dirty = true;
-            }
-            // 中文输入法会拦裸字母，主命令用 F 键；字母只作别名
-            KeyCode::Char('s') if plain => f.save()?,
-            KeyCode::F(2) => f.save()?,
-            KeyCode::Char('t') if plain => f.run_test(),
-            KeyCode::F(3) => f.run_test(),
-            _ => {}
+        if key(f, &k)? {
+            return Ok(());
         }
     }
+}
+
+/// 按键处理。true = 关闭设置页。
+fn key(f: &mut Form, k: &crossterm::event::KeyEvent) -> Result<bool> {
+    if !f.test.as_ref().map(|rx| rx.try_recv().is_ok()).unwrap_or(false) {
+        // 测试结果在 event_loop 里收取；内嵌模式由 tui 侧收
+    }
+    if f.picker.is_some() && k.code == KeyCode::Char('q') {
+        return Ok(true);
+    }
+    if let Some(p) = f.picker.as_mut() {
+        match k.code {
+            KeyCode::Esc => f.picker = None,
+            KeyCode::Up | KeyCode::Char('k') => p.sel = p.sel.saturating_sub(1),
+            KeyCode::Down | KeyCode::Char('j') => {
+                if p.sel + 1 < p.items.len() {
+                    p.sel += 1;
+                }
+            }
+            KeyCode::Enter => {
+                let chosen = p.items[p.sel].0;
+                let field = p.field;
+                if field == 0 {
+                    f.cfg.base_url = chosen.to_string();
+                } else {
+                    f.cfg.model = chosen.to_string();
+                    f.cfg.api_style = None;
+                }
+                f.dirty = true;
+                f.picker = None;
+                f.status = format!("已选择 {chosen}（F2 保存）");
+            }
+            _ => {}
+        }
+        return Ok(false);
+    }
+
+    if f.editing {
+        match k.code {
+            KeyCode::Esc => {
+                f.editing = false;
+                f.status = "已取消".into();
+            }
+            KeyCode::Enter => f.commit_edit(),
+            KeyCode::Char('u') if k.modifiers.contains(KeyModifiers::CONTROL) => f.buf.clear(),
+            KeyCode::Backspace => {
+                f.buf.pop();
+            }
+            KeyCode::Char(c) => f.buf.push(c),
+            _ => {}
+        }
+        return Ok(false);
+    }
+
+    match k.code {
+        KeyCode::Esc => return Ok(true),
+        KeyCode::Up | KeyCode::Char('k') => f.sel = f.sel.saturating_sub(1),
+        KeyCode::Down | KeyCode::Char('j') => {
+            if f.sel + 1 < FIELDS.len() {
+                f.sel += 1;
+            }
+        }
+        KeyCode::Enter => f.start_edit(),
+        KeyCode::Left if f.sel == 11 => f.cycle_theme(-1),
+        KeyCode::Right if f.sel == 11 => f.cycle_theme(1),
+        KeyCode::F(2) => f.save()?,
+        KeyCode::Char('s') if k.modifiers.contains(KeyModifiers::CONTROL) => f.save()?,
+        KeyCode::F(3) => f.run_test(),
+        _ => {}
+    }
+    Ok(false)
+}
+
+/// 在同一帧里画设置页（供 TUI 内嵌使用）。
+pub fn draw_form(fr: &mut ratatui::Frame, f: &Form) {
+    draw(fr, f)
+}
+
+/// 处理一个按键。返回 true = 关闭设置页。
+pub fn handle_form_key(f: &mut Form, k: &crossterm::event::KeyEvent) -> Result<bool> {
+    key(f, k)
 }
 
 fn draw(fr: &mut ratatui::Frame, f: &Form) {
