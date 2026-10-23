@@ -5,7 +5,7 @@ edition = "2021"
 description = "按住热键说话，文字进当前窗口（通义千问 ASR + 托盘）"
 license = "MIT"
 readme = "README.md"
-repository = "https://github.com/OWNER/dictate"
+repository = "https://github.com/w23x0/dictate"
 keywords = ["asr", "dictation", "speech-to-text", "qwen", "tray"]
 categories = ["command-line-utilities", "multimedia::audio"]
 

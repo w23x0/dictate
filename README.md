@@ -9,7 +9,7 @@
 ## 安装
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/<owner>/dictate/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/w23x0/dictate/main/install.sh | bash
 ```
 
 装到 `~/.local/bin/dictate`，带应用入口、开机自启、托盘常驻。
