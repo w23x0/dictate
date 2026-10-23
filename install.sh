@@ -38,6 +38,11 @@ esac
 
 mkdir -p "$BIN_DIR"
 
+# 升级时先停掉正在跑的实例，否则 install 会因为 Text file busy 失败
+pkill -f "$BIN_DIR/dictate" 2>/dev/null || true
+sleep 0.5
+rm -f "$HOME/.local/share/dictate/daemon.pid" 2>/dev/null || true
+
 if [[ "$MODE" == "local" ]]; then
   need cargo
   say "从本地源码编译（release）…"
@@ -90,6 +95,12 @@ case ":$PATH:" in
     export PATH=\"\$HOME/.local/bin:\$PATH\"" ;;
 esac
 
-# 起托盘（已有则不重复起）
-if "$BIN_DIR/dictate" >/dev/null 2>&1 || true; then :; fi
-say "完成。现在：$(printf '\033[1m')按住热键说话$(printf '\033[0m')；首次使用先跑 $(printf '\033[1m')dictate settings$(printf '\033[0m') 填 API key"
+# 起托盘（后台，不占终端）
+if ! pgrep -f "$BIN_DIR/dictate" >/dev/null 2>&1; then
+  setsid nohup "$BIN_DIR/dictate" >/dev/null 2>&1 &
+  sleep 1
+fi
+
+say "完成"
+echo "  用法：按住热键说话（默认 ctrl+space），托盘菜单里能看历史"
+echo "  首次使用：dictate settings 填 API key，然后 dictate doctor 验证"
