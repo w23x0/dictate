@@ -126,18 +126,28 @@ struct StatusFile {
     error: Option<String>,
 }
 
+fn init_term(term: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> {
+    enable_raw_mode()?;
+    execute!(term.backend_mut(), EnterAlternateScreen)?;
+    term.clear()?;
+    Ok(())
+}
+
+fn restore_term(term: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> {
+    disable_raw_mode()?;
+    execute!(term.backend_mut(), LeaveAlternateScreen)?;
+    term.show_cursor()?;
+    Ok(())
+}
+
 fn with_terminal<F>(f: F) -> Result<()>
 where
     F: FnOnce(&mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()>,
 {
-    enable_raw_mode()?;
-    let mut out = io::stdout();
-    execute!(out, EnterAlternateScreen)?;
-    let mut term = Terminal::new(CrosstermBackend::new(out))?;
+    let mut term = Terminal::new(CrosstermBackend::new(io::stdout()))?;
+    init_term(&mut term)?;
     let res = f(&mut term);
-    disable_raw_mode()?;
-    execute!(term.backend_mut(), LeaveAlternateScreen)?;
-    term.show_cursor()?;
+    restore_term(&mut term)?;
     res
 }
 
@@ -188,8 +198,17 @@ fn attach_loop(term: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App)
             continue;
         }
         let Event::Key(k) = event::read()? else { continue };
-        if k.kind == KeyEventKind::Press && handle_key(app, &k)? {
-            return Ok(());
+        if k.kind != KeyEventKind::Press {
+            continue;
+        }
+        match handle_key(app, &k)? {
+            Outcome::Continue => {}
+            Outcome::Quit => return Ok(()),
+            Outcome::Settings => {
+                restore_term(term)?;
+                crate::settings_ui::run()?;
+                init_term(term)?;
+            }
         }
     }
 }
@@ -202,14 +221,38 @@ fn event_loop(term: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) 
             continue;
         }
         let Event::Key(k) = event::read()? else { continue };
-        if k.kind == KeyEventKind::Press && handle_key(app, &k)? {
-            return Ok(());
+        if k.kind != KeyEventKind::Press {
+            continue;
+        }
+        match handle_key(app, &k)? {
+            Outcome::Continue => {}
+            Outcome::Quit => return Ok(()),
+            Outcome::Settings => {
+                restore_term(term)?;
+                crate::settings_ui::run()?;
+                init_term(term)?;
+            }
         }
     }
 }
 
-/// 处理一个按键。返回 true = 退出。
-fn handle_key(app: &mut App, k: &crossterm::event::KeyEvent) -> Result<bool> {
+enum Outcome {
+    Continue,
+    Quit,
+    Settings,
+}
+
+/// 给守护进程递一条命令（它每 100 ms 读一次）。
+fn send_control(cmd: &str) {
+    let path = crate::config::control_path();
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).ok();
+    }
+    let _ = std::fs::write(&path, cmd);
+}
+
+/// 处理一个按键。
+fn handle_key(app: &mut App, k: &crossterm::event::KeyEvent) -> Result<Outcome> {
     if app.searching {
         match k.code {
             KeyCode::Esc => {
@@ -228,25 +271,40 @@ fn handle_key(app: &mut App, k: &crossterm::event::KeyEvent) -> Result<bool> {
             }
             _ => {}
         }
-        return Ok(false);
+        return Ok(Outcome::Continue);
     }
     // 带修饰键的按键一律不当作动作：Ctrl+D 是终端 EOF、Ctrl+C 是中断
     let plain = k.modifiers.is_empty() || k.modifiers == KeyModifiers::SHIFT;
     if k.modifiers.contains(KeyModifiers::CONTROL) {
         match k.code {
-            KeyCode::Char('c') | KeyCode::Char('d') => return Ok(true),
-            _ => return Ok(false),
+            KeyCode::Char('c') | KeyCode::Char('d') => return Ok(Outcome::Quit),
+            _ => return Ok(Outcome::Continue),
         }
     }
     match k.code {
-        KeyCode::Esc => return Ok(true),
+        KeyCode::Esc => return Ok(Outcome::Quit),
         KeyCode::Up => app.selected = app.selected.saturating_sub(1),
         KeyCode::Down => {
             if app.selected + 1 < app.shown.len() {
                 app.selected += 1;
             }
         }
-        KeyCode::Char('q') if plain => return Ok(true),
+        KeyCode::Char('q') if plain => return Ok(Outcome::Quit),
+        KeyCode::Char('s') if plain => return Ok(Outcome::Settings),
+        KeyCode::Char(' ') => {
+            // 手动录音：不依赖热键（托盘没起来时也能用）
+            let recording = matches!(app.phase, Phase::Recording(_));
+            send_control(if recording { "stop" } else { "start" });
+            app.status = if recording {
+                "已提交（手动停止）".into()
+            } else {
+                "手动开始录音…".into()
+            };
+        }
+        KeyCode::Char('x') if plain => {
+            send_control("quit");
+            app.status = "已通知守护进程退出".into();
+        }
         KeyCode::Char('k') if plain => app.selected = app.selected.saturating_sub(1),
         KeyCode::Char('j') if plain => {
             if app.selected + 1 < app.shown.len() {
@@ -284,7 +342,7 @@ fn handle_key(app: &mut App, k: &crossterm::event::KeyEvent) -> Result<bool> {
         }
         _ => {}
     }
-    Ok(false)
+    Ok(Outcome::Continue)
 }
 
 fn draw(f: &mut ratatui::Frame, app: &App) {
@@ -439,7 +497,7 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
     let hints = Rect { y: panel.y + 1, ..inner };
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
-            "↑↓ 选择   ⏎ 复制   / 搜索   d 删除   c 清空   q 退出",
+            "空格 手动录音   s 设置   ↑↓ 选择   ⏎ 复制   / 搜索   d 删除   c 清空   q 退出",
             Style::default().fg(th.faint),
         )))
         .alignment(ratatui::layout::Alignment::Right)

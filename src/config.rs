@@ -91,6 +91,14 @@ pub fn status_path() -> PathBuf {
         .join("status.json")
 }
 
+/// 终端视图给守护进程下命令的投递箱（单行文本，守护进程读走后删除）。
+pub fn control_path() -> PathBuf {
+    dirs::data_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("dictate")
+        .join("control")
+}
+
 pub fn history_path() -> PathBuf {
     dirs::data_dir()
         .unwrap_or_else(|| PathBuf::from("."))

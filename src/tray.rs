@@ -50,6 +50,10 @@ pub fn run(cfg: Config) -> Result<()> {
         }
         let tip = daemon.tick();
         tray.set_tooltip(Some(&tip)).ok();
+        if daemon.quit {
+            gtk::main_quit();
+            return glib::ControlFlow::Break;
+        }
         glib::ControlFlow::Continue
     });
 
@@ -97,6 +101,9 @@ pub fn run(cfg: Config) -> Result<()> {
         }
         let tip = daemon.tick();
         tray.set_tooltip(Some(&tip)).ok();
+        if daemon.quit {
+            return Ok(());
+        }
         std::thread::sleep(Duration::from_millis(100));
     }
 }

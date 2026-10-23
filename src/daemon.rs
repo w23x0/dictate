@@ -25,6 +25,7 @@ pub struct Daemon {
     hk: Receiver<HotkeyEvent>,
     worker: (Sender<Result<String, String>>, Receiver<Result<String, String>>),
     pub phase: Phase,
+    pub quit: bool,
     pub last_error: Option<String>,
     pub last_text: Option<String>,
 }
@@ -42,6 +43,7 @@ impl Daemon {
             hk,
             worker: channel(),
             phase: Phase::Idle,
+            quit: false,
             last_error: None,
             last_text: None,
         })
@@ -75,8 +77,64 @@ impl Daemon {
         }
     }
 
+    /// 手动开始录音（来自终端视图或托盘）。
+    pub fn start(&mut self) {
+        if self.phase != Phase::Idle {
+            return;
+        }
+        match self.capture.start(self.cfg.max_seconds) {
+            Ok(()) => {
+                self.phase = Phase::Recording(Instant::now());
+                self.last_error = None;
+            }
+            Err(e) => self.last_error = Some(format!("启动录音失败：{e}")),
+        }
+    }
+
+    /// 手动提交（停止并转写）。
+    pub fn stop(&mut self) {
+        if !matches!(self.phase, Phase::Recording(_)) {
+            return;
+        }
+        match self.capture.stop() {
+            Ok((rate, pcm)) => {
+                let secs = pcm.len() as f32 / rate as f32;
+                self.phase = Phase::Transcribing(Instant::now());
+                let cfg = self.cfg.clone();
+                let hist = History::new(crate::config::history_path());
+                let tx = self.worker.0.clone();
+                std::thread::spawn(move || {
+                    let out = pipeline::prepare_wav(&cfg, &pcm, rate)
+                        .and_then(|wav| pipeline::transcribe_and_record(&cfg, &hist, &wav, secs))
+                        .map_err(|e| format!("{e:#}"));
+                    let _ = tx.send(out);
+                });
+            }
+            Err(e) => {
+                self.phase = Phase::Idle;
+                self.last_error = Some(format!("取录音失败：{e}"));
+            }
+        }
+    }
+
+    /// 读一次控制文件（终端视图 / 外部脚本下命令）。
+    fn poll_control(&mut self) {
+        let path = crate::config::control_path();
+        let Ok(cmd) = std::fs::read_to_string(&path) else {
+            return;
+        };
+        std::fs::remove_file(&path).ok();
+        match cmd.trim() {
+            "start" => self.start(),
+            "stop" => self.stop(),
+            "quit" => self.quit = true,
+            other => self.last_error = Some(format!("未知控制命令：{other}")),
+        }
+    }
+
     /// 处理一遍事件；返回托盘要显示的提示文字。
     pub fn tick(&mut self) -> String {
+        self.poll_control();
         while let Ok(ev) = self.hk.try_recv() {
             match (ev, self.phase) {
                 (HotkeyEvent::Press, Phase::Idle) => {
@@ -85,35 +143,9 @@ impl Daemon {
                     if let Ok(cfg) = crate::config::load() {
                         self.cfg = cfg;
                     }
-                    match self.capture.start(self.cfg.max_seconds) {
-                    Ok(()) => {
-                        self.phase = Phase::Recording(Instant::now());
-                        self.last_error = None;
-                    }
-                    Err(e) => self.last_error = Some(format!("启动录音失败：{e}")),
-                    }
+                    self.start();
                 }
-                (HotkeyEvent::Release, Phase::Recording(_)) => match self.capture.stop() {
-                    Ok((rate, pcm)) => {
-                        let secs = pcm.len() as f32 / rate as f32;
-                        self.phase = Phase::Transcribing(Instant::now());
-                        let cfg = self.cfg.clone();
-                        let hist = History::new(crate::config::history_path());
-                        let tx = self.worker.0.clone();
-                        std::thread::spawn(move || {
-                            let out = pipeline::prepare_wav(&cfg, &pcm, rate)
-                                .and_then(|wav| {
-                                    pipeline::transcribe_and_record(&cfg, &hist, &wav, secs)
-                                })
-                                .map_err(|e| format!("{e:#}"));
-                            let _ = tx.send(out);
-                        });
-                    }
-                    Err(e) => {
-                        self.phase = Phase::Idle;
-                        self.last_error = Some(format!("取录音失败：{e}"));
-                    }
-                },
+                (HotkeyEvent::Release, Phase::Recording(_)) => self.stop(),
                 _ => {}
             }
         }
