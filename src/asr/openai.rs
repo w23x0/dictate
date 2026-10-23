@@ -30,7 +30,10 @@ pub fn transcribe(c: &QwenClient, wav: &[u8]) -> Result<String> {
     let body = request_body(c, wav);
     let raw = super::post_json(c, &c.http_endpoint(), &body, &[])?;
     let v: serde_json::Value = serde_json::from_str(&raw).map_err(|_| {
-        anyhow::anyhow!("响应不是 JSON：{}", raw.chars().take(200).collect::<String>())
+        anyhow::anyhow!(
+            "响应不是 JSON：{}",
+            raw.chars().take(200).collect::<String>()
+        )
     })?;
     text_from(&v, &["/choices/0/message/content", "/choices/0/text"])
 }

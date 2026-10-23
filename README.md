@@ -1,158 +1,130 @@
 # dictate
 
-通义千问 ASR 听写器。一条链路：**热键 → 采集 → 静音门 → AGC → 云端转写 → 历史**。
-没有润色、没有翻译、没有笔记、没有词汇表、没有账号。
+把「按住热键说话」变成文字：通义千问 ASR + 本机托盘 + 终端界面。
+从 LazyTyper 里只留下一条链路——**录音 → 转写 → 交付**，其余（润色、翻译、笔记、词汇表、本地模型、账号、遥测）全部没有。
 
-## 现状
-
-| 模块 | 状态 |
-|---|---|
-| 采集（cpal，任意率/声道）→ 16 kHz 单声道 | ✅ 真机验证（44.1 kHz 设备） |
-| 重采样（rubato `FftFixedIn`，流式） | ✅ 单测 |
-| 静音门（20 ms 帧、裁首尾、尾部静音计时） | ✅ 单测 + `record` 自动结束 |
-| AGC（−20 dBFS 目标、10 ms 攻击 / 200 ms 释放、+30 dB 上限、tanh 软限幅） | ✅ 单测（−40/−10 dBFS 双端收敛） |
-| Qwen ASR（OpenAI 兼容 `chat/completions` + base64） | ✅ 真跑（mock 服务端收到正确报文） |
-| 历史（`history.jsonl`，容错读） | ✅ 单测 + TUI 实测 |
-| 终端历史窗口（ratatui，复制/搜索/删除/清空） | ✅ pty 实测（OSC52 复制内容逐字节核对） |
-| 全局热键（Linux evdev / Windows LL hook） | ✅ Linux 真机监听；Windows 只做了 `cargo check` |
-| 托盘常驻 / 无终端运行 | ✅ Linux 真机（GNOME + appindicator 扩展），托盘项已注册 |
-| 应用搜索（.desktop + 图标） | ✅ 首次运行自动写 `~/.local/share/applications/dictate.desktop` |
-| 终端内配置界面 | ✅ `dictate settings` |
-| 实时 WS 转写 | ⬜ 未做 |
-
-## 用法
-
-```bash
-dictate                 # 托盘常驻：无终端也能用（关掉终端不影响）
-dictate settings        # 终端里改配置（不用手写 TOML）
-dictate run             # 终端版：热键 + 历史列表常驻
-cargo run --release -- doctor                               # 不发录音，验 key / 区域 / 模型
-cargo run --release -- probe --seconds 3 --out /tmp/a.wav   # 验采集：打印电平、可落盘
-cargo run --release -- record                               # 录到静音自动结束，直接转写
-cargo run --release -- transcribe /tmp/a.wav                # 转写现成 WAV
-cargo run --release -- history                              # 终端历史窗口
+```
+按住 ctrl+space 说话 → 松开 → 文字进剪贴板并自动粘贴到当前窗口，同时记入历史
 ```
 
-历史窗口按键：`↑↓/jk` 选择 · `Enter` 复制（OSC 52，SSH 里也有效）· `/` 搜索 · `d` 删除 ·
-`c` 清空 · `r` 刷新 · `q` 退出。
+## 安装（一行）
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/<owner>/dictate/main/install.sh | bash
+```
+
+它会：装二进制到 `~/.local/bin/dictate`、写应用入口（能被应用搜索找到）、设置开机自启、后台起托盘。
+
+从源码装：
+
+```bash
+git clone https://github.com/<owner>/dictate && cd dictate && ./install.sh --local
+```
+
+卸载：`./uninstall.sh`（加 `--purge` 连配置和历史一起删）。
+
+> 为什么不是 `apt`：一个自用的小工具没必要进发行版仓库（要打包、签名、审核、跟同步）。GitHub Release 出 `dictate-<target>.tar.gz`，脚本下载解压即可，升级也就是再跑一遍。
+
+## 日常使用
+
+```bash
+dictate              # 托盘常驻（开机自启跑的就是这个）：热键说话，托盘菜单看历史/设置
+dictate history      # 终端里看历史（实时刷新，跟着守护进程走）
+dictate settings     # 改配置（模型、地址、key、热键、交付方式）
+```
+
+第一次用必须先配置（没有 key 什么都转不出来）：
+
+```bash
+dictate settings     # 模型/地址用列表选，key 直接填，改完自动保存
+dictate doctor       # 不录音，验 key / 区域 / 模型 / 粘贴能力
+```
+
+## 交付方式（`paste`）
+
+| 值 | 行为 |
+|---|---|
+| `auto`（默认） | 存原剪贴板 → 写入文本 → 模拟粘贴键（`wtype`/`ydotool`/`xdotool` 里有哪个用哪个）→ 400 ms 后还原剪贴板 |
+| `clipboard` | 只写剪贴板，不按键 |
+| `off` | 只进历史 |
+
+Wayland（GNOME）下没有 `wtype`/`ydotool` 时只能做到写剪贴板，程序会在状态里说明，按 `Ctrl+V` 即可。
+`dictate doctor` 会列出当前机器上有哪些工具。
 
 ## 热键
 
-`dictate run` 常驻：按下热键开始录音，松开即提交，结果进历史窗。
+| `hotkey_mode` | 行为 |
+|---|---|
+| `hold`（默认） | 按住说话，松开提交；按一下就松（<200 ms）判为误触，直接丢弃 |
+| `toggle` | 按一下开始，再按一下停止 |
 
-- **Linux**：读 `/dev/input/event*`（X11 / Wayland 通用）。需要 `input` 组：
-  `sudo usermod -aG input $USER` 然后重新登录。启动时会打印监听到的设备名。
-- **Windows**：`WH_KEYBOARD_LL` 低级钩子，不需要管理员权限（`cargo check --target x86_64-pc-windows-gnu` 通过，未在真机跑过）。
-- 默认 `ctrl+space`，可在配置里改：`hotkey = "alt+shift+d"` / `f9`（部分发行版把 `ctrl+space` 绑给了输入法切换，冲突就换一个）。
+默认 `ctrl+space`，改：`dictate settings` 或 `/hotkey alt+shift+d`。
 
-## 支持的模型
+- **Linux**：直读 `/dev/input/event*`（X11 / Wayland 通用），需要 `input` 组
+- **Windows**：`WH_KEYBOARD_LL` 低级钩子（未在真机验证，仅 `cargo check` 通过）
 
-三种报文形状，按模型名自动选，也可用 `api_style` 强制（`openai` / `dashscope` / `ws`）：
+## 终端界面
 
-| 模型 | 形状 | 端点 | 备注 |
-|---|---|---|---|
-| `qwen3-asr-flash` | OpenAI 兼容 | `{base}/compatible-mode/v1/chat/completions` | 10 MB / 5 分钟 |
-| `qwen3-asr-flash`（`api_style="dashscope"`） | DashScope 同步 | `{base}/api/v1/services/aigc/multimodal-generation/generation` | 内容字段是 `{"audio": …}` |
-| `qwen-audio-3.1-asr-flash`、`qwen-audio-3.0-asr-flash` | DashScope 同步 | 同上 | 内容字段是 `{"type":"input_audio",…}`，带 `format`/`sample_rate`；2 GB / 5 分钟 |
-| `qwen-audio-3.1-asr-flash-message`、`qwen-audio-3.1-asr-flash-streaming`、`qwen3-asr-flash-realtime` | WebSocket | `wss://{host}/api-ws/v1/inference` | `run-task` → 二进制音频 → `finish-task`；只取最终句 |
-| `*-filetrans` | — | — | 只能走「上传 → 异步任务 → 轮询」，**没实现**，选到会直接报错 |
-
-`base_url` 填到主机即可（`https://dashscope.aliyuncs.com`、`https://{WorkspaceId}.cn-beijing.maas.aliyuncs.com`），
-带 `/compatible-mode/v1` 之类的尾巴会自动剥掉。
-
-三种形状都有本地假服务端的端到端测试（真 socket），见 `src/asr/e2e.rs`。
-
-## 界面与键位
-
-扁平布局（grok-cli 那种），无边框；底部填充面板显示状态与提示。配色按终端背景色推导。
+扁平布局，底部一行命令（和 grok-cli 一样，不背快捷键）：
 
 ```
 ◆ dictate  v0.1.0  ctrl+space · qwen3-asr-flash          ● 就绪   12 条
 
- 20:31  ❯ 今天下午三点跟产品过一下这个需求，顺便把接口文档同步给后端。  1.8s
- 20:28  ❯ 帮我把这段代码里的 unwrap 全部换成 anyhow 的 context。        0.9s
+▌ 22:37  ❯ 今天下午三点跟产品过一下这个需求，顺便把接口文档同步给后端。  1.8s
+  22:35  ❯ 帮我把这段代码里的 unwrap 全部换成 anyhow 的 context。        0.9s
 
-  ❯ 按住热键说话
-         空格 录音   ⏎ 复制   Del 删除   Ctrl+F 搜索   F1 帮助   F2 设置   Esc 退出
+❯ /                                   ← 真的输入框，光标停在这（输入法候选框跟着走）
+  /settings 打开设置   /model 切换模型   /record 手动录音   /help 帮助
 ```
-
-### 热键语义（配置 `hotkey_mode`）
-
-| 值 | 行为 |
-|---|---|
-| `hold`（默认） | **按住**说话，松开提交；按一下就松（< 200 ms）视为误触，丢弃 |
-| `toggle` | 按一下开始，再按一下停止 |
-
-### 交互：底部一行命令（不是记快捷键）
-
-和 grok-cli 一样，底部永远有一行可输入的提示符。输入 `/` 会列出命令，`Tab` 补全：
 
 | 命令 | 作用 |
 |---|---|
-| `/settings` | 打开设置页（`Esc` 返回） |
-| `/model [名字]` | 切模型；不带参数打开列表选择 |
-| `/base [url]` | 切服务地址；不带参数打开列表选择 |
-| `/key sk-…` | 存 API key（写入配置文件，权限 600） |
-| `/hotkey ctrl+space` | 换热键（重启 dictate 生效） |
-| `/mode hold\|toggle` | 按住说话 / 按一下开关 |
-| `/record` | 手动开始或停止录音 |
-| `/search 文字` | 过滤历史（也可直接打字，实时过滤） |
-| `/clear` / `/daemon stop` | 清空历史 / 退出守护进程（都要回车确认） |
-| `/help` · `/quit` | 帮助 · 退出视图 |
+| `/settings` | 设置页（`Esc` 返回，改完自动保存） |
+| `/model` `/base` | 不带参数 = 列表选；带参数 = 直接设 |
+| `/key sk-…` · `/hotkey ctrl+space` · `/mode hold\|toggle` | 改了立即写配置 |
+| `/record` | 手动开关录音 |
+| `/search 文字` | 过滤历史（直接打字也实时过滤） |
+| `/clear` · `/daemon stop` | 清空历史 / 退守护进程（回车确认） |
+| `/help` · `/quit` | 帮助 / 退出视图 |
 
-**为什么是命令行**：字母键在中文输入法下会被吃掉，F 键又没人记得住；斜杠命令能自查（打 `/` 就列出来），也符合 grok-cli 的习惯。
+键：`↑↓` 选择、`⏎` 输入为空时复制选中、`Del` 删除、`Esc` 清空输入/退出。
 
-### 光标与输入法
+## 支持的模型
 
-底部输入行是**真的输入框**：终端光标始终停在输入位置，所以 fcitx 的候选框会贴着光标出现，不会飘到屏幕外。
+| 模型 | 报文形状 | 端点 |
+|---|---|---|
+| `qwen3-asr-flash` | OpenAI 兼容 | `{base}/compatible-mode/v1/chat/completions` |
+| `qwen-audio-3.1-asr-flash` · `qwen-audio-3.0-asr-flash` | DashScope 同步 | `{base}/api/v1/services/aigc/multimodal-generation/generation` |
+| `qwen-audio-3.1-asr-flash-message` · `-streaming` · `qwen3-asr-flash-realtime` | WebSocket | `wss://{host}/api-ws/v1/inference` |
+| `*-filetrans` | — | 只支持异步任务接口，**没实现**（选到会直接报错说明） |
 
-### 其它键
-
-| 键 | 作用 |
-|---|---|
-| `↑↓` `PgUp/PgDn` `Home/End` | 选择记录 |
-| `⏎` | 输入为空时 = 复制选中（OSC 52）；有内容时 = 执行 |
-| `Del` | 删除选中 |
-| `Esc` | 清空输入；输入已空时退出视图 |
+形状由模型名自动决定；`api_style` 可强制。
 
 ## 配置
 
-`~/.config/dictate/config.toml`（模板见 `config.example.toml`）。key 优先级：
-`DASHSCOPE_API_KEY` > 配置里的 `api_key`。
+`~/.config/dictate/config.toml`（权限 600，含 key）。key 也认环境变量 `DASHSCOPE_API_KEY`（优先）。
+模板见 [`config.example.toml`](config.example.toml)。
 
-```toml
-base_url = "https://dashscope.aliyuncs.com"   # 新加坡：dashscope-intl.aliyuncs.com
-model = "qwen3-asr-flash"
-enable_itn = false
-silence_stop_ms = 1500
-max_seconds = 240
+## 目录结构
+
+```
+src/
+├── main.rs          CLI 入口
+├── app/             常驻进程：daemon（热键→录音→转写→交付）、tray、desktop、inject（粘贴）
+├── core/            平台无关：config、history、pipeline（WAV 加工 + 转写 + 落库）
+├── audio/           cpal 采集、rubato 重采样、agc（自动增益）、vad（静音门）
+├── asr/             三种报文形状 + 本地假服务端端到端测试
+└── ui/              终端界面：tui（列表+命令）、settings_ui、theme、icon
 ```
 
-## 为什么是 `chat/completions` 而不是 `/v1/audio/transcriptions`
+数据都在 `~/.local/share/dictate/`：`history.jsonl`、`status.json`、`control`、`daemon.pid`。
 
-Qwen3-ASR-Flash 的 OpenAI 兼容模式走的是 chat 接口：
-
-```json
-{
-  "model": "qwen3-asr-flash",
-  "messages": [{"role":"user","content":[
-    {"type":"input_audio","input_audio":{"data":"data:audio/wav;base64,…"}}]}],
-  "asr_options": {"enable_itn": false, "language": "zh"},
-  "stream": false
-}
-```
-
-结果在 `choices[0].message.content`。服务端硬限：**10 MB / 5 分钟**（`max_seconds` 默认 240 s 留余量）。
-
-## 设计取舍
-
-- **录音先落内存，失败不丢**：转写失败会写一条 `status: "error: …"` 的历史（含错误原因），下次可对照重录。
-- **AGC 不抬静音**：低于 −55 dBFS 的块不参与增益计算，否则静音段会被放大成嘶声。
-- **TUI 只认裸字母**：带修饰键的按键（Ctrl+D 是终端 EOF）不会触发删除——这是实测踩到的坑。
-- **不自动粘贴**：转写结果只进历史，由你自己复制（`Enter` → OSC 52）。
-
-## 测试
+## 开发
 
 ```bash
-cargo test        # 21 条：AGC 收敛/限幅、VAD 裁切、重采样、WAV 往返、历史 CRUD、报文形状、OSC52
+cargo test            # 52 条：AGC/VAD/重采样/WAV、三种报文形状真 socket 端到端、命令输入、历史 CRUD
+cargo clippy --all-targets
+cargo fmt
 ```
+
+发布：打 tag 后 `.github/workflows/release.yml` 会编译并上传 `dictate-<target>.tar.gz`。

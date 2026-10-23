@@ -17,8 +17,8 @@ use ratatui::Terminal;
 
 use unicode_width::UnicodeWidthStr;
 
-use crate::config::{self, Config};
-use crate::theme::{Mode, Theme};
+use crate::core::config::{self, Config};
+use crate::ui::theme::{Mode, Theme};
 
 /// 按**显示宽度**补齐（中文占两格），否则中英混排的列会歪。
 fn pad(s: &str, width: usize) -> String {
@@ -32,10 +32,16 @@ fn pad(s: &str, width: usize) -> String {
 
 /// 支持的模型（只列真的能用这三种报文形状跑的）。
 const MODELS: &[(&str, &str)] = &[
-    ("qwen3-asr-flash", "OpenAI 兼容 · 10 MB / 5 分钟 · 支持 ITN、语言指定"),
+    (
+        "qwen3-asr-flash",
+        "OpenAI 兼容 · 10 MB / 5 分钟 · 支持 ITN、语言指定",
+    ),
     ("qwen-audio-3.1-asr-flash", "DashScope 同步 · 2 GB / 5 分钟"),
     ("qwen-audio-3.0-asr-flash", "DashScope 同步 · 2 GB / 5 分钟"),
-    ("qwen-audio-3.1-asr-flash-message", "WebSocket · 只收 16 kHz"),
+    (
+        "qwen-audio-3.1-asr-flash-message",
+        "WebSocket · 只收 16 kHz",
+    ),
     ("qwen-audio-3.1-asr-flash-streaming", "WebSocket 流式输出"),
     ("qwen3-asr-flash-realtime", "WebSocket 实时"),
 ];
@@ -45,7 +51,7 @@ const BASES: &[(&str, &str)] = &[
     ("https://dashscope-intl.aliyuncs.com", "新加坡"),
 ];
 
-const FIELDS: [&str; 12] = [
+const FIELDS: [&str; 13] = [
     "服务地址",
     "模型",
     "报文形状",
@@ -58,6 +64,7 @@ const FIELDS: [&str; 12] = [
     "单次上限 (s)",
     "超时 (s)",
     "配色 (auto/dark/light)",
+    "交付方式",
 ];
 
 pub struct Form {
@@ -118,11 +125,13 @@ impl Form {
             4 => self.cfg.language.clone().unwrap_or_else(|| "auto".into()),
             5 => if self.cfg.enable_itn { "开" } else { "关" }.into(),
             6 => self.cfg.hotkey.clone(),
-            7 => if self.cfg.hotkey_mode.eq_ignore_ascii_case("toggle") {
-                "toggle（按一下开、再按一下停）".into()
-            } else {
-                "hold（按住说话）".into()
-            },
+            7 => {
+                if self.cfg.hotkey_mode.eq_ignore_ascii_case("toggle") {
+                    "toggle（按一下开、再按一下停）".into()
+                } else {
+                    "hold（按住说话）".into()
+                }
+            }
             8 => self.cfg.silence_stop_ms.to_string(),
             9 => format!("{}", self.cfg.max_seconds),
             10 => self.cfg.timeout_secs.to_string(),
@@ -131,6 +140,11 @@ impl Form {
                 .theme
                 .clone()
                 .unwrap_or_else(|| "auto（问终端）".into()),
+            12 => match self.cfg.paste.as_str() {
+                "off" => "off（只进历史）".into(),
+                "clipboard" => "clipboard（只写剪贴板）".into(),
+                _ => "auto（剪贴板 + 自动粘贴）".into(),
+            },
             _ => String::new(),
         }
     }
@@ -158,9 +172,22 @@ impl Form {
             self.cycle_theme(1);
             return;
         }
+        if i == 12 {
+            self.cfg.paste = match self.cfg.paste.as_str() {
+                "auto" => "clipboard".into(),
+                "clipboard" => "off".into(),
+                _ => "auto".into(),
+            };
+            self.dirty = true;
+            return;
+        }
         if i == 7 {
             let toggle = self.cfg.hotkey_mode.eq_ignore_ascii_case("toggle");
-            self.cfg.hotkey_mode = if toggle { "hold".into() } else { "toggle".into() };
+            self.cfg.hotkey_mode = if toggle {
+                "hold".into()
+            } else {
+                "toggle".into()
+            };
             self.dirty = true;
             return;
         }
@@ -168,7 +195,10 @@ impl Form {
             self.picker = Some(Picker {
                 title: "选择模型",
                 items: MODELS,
-                sel: MODELS.iter().position(|(m, _)| *m == self.cfg.model).unwrap_or(0),
+                sel: MODELS
+                    .iter()
+                    .position(|(m, _)| *m == self.cfg.model)
+                    .unwrap_or(0),
                 field: 1,
             });
             return;
@@ -226,7 +256,13 @@ impl Form {
                     self.cfg.model = v.clone();
                 }
                 3 => self.cfg.api_key = if v.is_empty() { None } else { Some(v.clone()) },
-                4 => self.cfg.language = if v.is_empty() || v == "auto" { None } else { Some(v.clone()) },
+                4 => {
+                    self.cfg.language = if v.is_empty() || v == "auto" {
+                        None
+                    } else {
+                        Some(v.clone())
+                    }
+                }
                 6 => {
                     crate::hotkey::Spec::parse(&v)?;
                     self.cfg.hotkey = v.clone();
@@ -238,9 +274,14 @@ impl Form {
                         anyhow::bail!("只能是 hold 或 toggle");
                     }
                 }
-                8 => self.cfg.silence_stop_ms = v.parse().map_err(|_| anyhow::anyhow!("要是整数 ms"))?,
+                8 => {
+                    self.cfg.silence_stop_ms =
+                        v.parse().map_err(|_| anyhow::anyhow!("要是整数 ms"))?
+                }
                 9 => self.cfg.max_seconds = v.parse().map_err(|_| anyhow::anyhow!("要是数字秒"))?,
-                10 => self.cfg.timeout_secs = v.parse().map_err(|_| anyhow::anyhow!("要是整数秒"))?,
+                10 => {
+                    self.cfg.timeout_secs = v.parse().map_err(|_| anyhow::anyhow!("要是整数秒"))?
+                }
                 _ => {}
             }
             Ok(())
@@ -276,7 +317,10 @@ impl Form {
         self.picker = Some(Picker {
             title: "选择模型",
             items: MODELS,
-            sel: MODELS.iter().position(|(m, _)| *m == self.cfg.model).unwrap_or(0),
+            sel: MODELS
+                .iter()
+                .position(|(m, _)| *m == self.cfg.model)
+                .unwrap_or(0),
             field: 1,
         });
     }
@@ -285,7 +329,10 @@ impl Form {
         self.picker = Some(Picker {
             title: "选择服务地址",
             items: BASES,
-            sel: BASES.iter().position(|(u, _)| *u == self.cfg.base_url).unwrap_or(0),
+            sel: BASES
+                .iter()
+                .position(|(u, _)| *u == self.cfg.base_url)
+                .unwrap_or(0),
             field: 0,
         });
     }
@@ -310,7 +357,7 @@ impl Form {
         let (tx, rx) = channel();
         let cfg = self.cfg.clone();
         std::thread::spawn(move || {
-            let out = crate::pipeline::self_test(&cfg).map_err(|e| format!("{e:#}"));
+            let out = crate::core::pipeline::self_test(&cfg).map_err(|e| format!("{e:#}"));
             let _ = tx.send(out);
         });
         self.test = Some(rx);
@@ -358,7 +405,9 @@ fn event_loop(term: &mut Terminal<CrosstermBackend<std::io::Stdout>>, f: &mut Fo
         if !event::poll(std::time::Duration::from_millis(100))? {
             continue;
         }
-        let Event::Key(k) = event::read()? else { continue };
+        let Event::Key(k) = event::read()? else {
+            continue;
+        };
         if k.kind != KeyEventKind::Press {
             continue;
         }
@@ -370,7 +419,12 @@ fn event_loop(term: &mut Terminal<CrosstermBackend<std::io::Stdout>>, f: &mut Fo
 
 /// 按键处理。true = 关闭设置页。
 fn key(f: &mut Form, k: &crossterm::event::KeyEvent) -> Result<bool> {
-    if !f.test.as_ref().map(|rx| rx.try_recv().is_ok()).unwrap_or(false) {
+    if !f
+        .test
+        .as_ref()
+        .map(|rx| rx.try_recv().is_ok())
+        .unwrap_or(false)
+    {
         // 测试结果在 event_loop 里收取；内嵌模式由 tui 侧收
     }
     if f.picker.is_some() && k.code == KeyCode::Char('q') {
@@ -492,7 +546,11 @@ fn draw(fr: &mut ratatui::Frame, f: &Form) {
         let mut state = ListState::default();
         state.select(Some(p.sel));
         let list = List::new(rows)
-            .highlight_style(Style::default().bg(th.selected_bg).add_modifier(Modifier::BOLD))
+            .highlight_style(
+                Style::default()
+                    .bg(th.selected_bg)
+                    .add_modifier(Modifier::BOLD),
+            )
             .highlight_symbol("❯");
         fr.render_stateful_widget(list, chunks[2], &mut state);
         fr.render_widget(
@@ -547,16 +605,21 @@ fn draw(fr: &mut ratatui::Frame, f: &Form) {
             } else {
                 f.value(i)
             };
-            ListItem::new(Line::from(vec![
-                Span::styled(format!(" {}{}", pad(label, 24), value), Style::default()),
-            ]))
+            ListItem::new(Line::from(vec![Span::styled(
+                format!(" {}{}", pad(label, 24), value),
+                Style::default(),
+            )]))
         })
         .collect();
 
     let mut state = ListState::default();
     state.select(Some(f.sel));
     let list = List::new(items)
-        .highlight_style(Style::default().bg(th.selected_bg).add_modifier(Modifier::BOLD))
+        .highlight_style(
+            Style::default()
+                .bg(th.selected_bg)
+                .add_modifier(Modifier::BOLD),
+        )
         .highlight_symbol("❯ ");
     fr.render_stateful_widget(list, chunks[2], &mut state);
 
@@ -571,7 +634,10 @@ fn draw(fr: &mut ratatui::Frame, f: &Form) {
 
     // 底部面板
     let panel = chunks[3];
-    fr.render_widget(Block::default().style(Style::default().bg(th.panel_bg)), panel);
+    fr.render_widget(
+        Block::default().style(Style::default().bg(th.panel_bg)),
+        panel,
+    );
     let inner = Rect {
         x: panel.x + 2,
         y: panel.y,
@@ -591,7 +657,10 @@ fn draw(fr: &mut ratatui::Frame, f: &Form) {
         .style(Style::default().bg(th.panel_bg)),
         inner,
     );
-    let hints = Rect { y: panel.y + 1, ..inner };
+    let hints = Rect {
+        y: panel.y + 1,
+        ..inner
+    };
     fr.render_widget(
         Paragraph::new(Line::from(Span::styled(
             "↑↓ 选择   ⏎ 修改/选择   F2 保存   F3 测试   Esc 退出",
@@ -617,11 +686,15 @@ mod tests {
     fn model_pick_follows_model_name() {
         // 报文形状由模型名推断，不再手填
         assert_eq!(
-            crate::asr::pick_style("qwen3-asr-flash", None).unwrap().name(),
+            crate::asr::pick_style("qwen3-asr-flash", None)
+                .unwrap()
+                .name(),
             "openai-compatible"
         );
         assert_eq!(
-            crate::asr::pick_style("qwen-audio-3.1-asr-flash-message", None).unwrap().name(),
+            crate::asr::pick_style("qwen-audio-3.1-asr-flash-message", None)
+                .unwrap()
+                .name(),
             "websocket"
         );
     }
@@ -634,7 +707,11 @@ mod tests {
         f.buf = "abc".into();
         f.commit_edit();
         // 非法值：保持编辑态让用户改，配置不变
-        assert!(f.editing && f.status.starts_with("没改"), "status={}", f.status);
+        assert!(
+            f.editing && f.status.starts_with("没改"),
+            "status={}",
+            f.status
+        );
         assert_eq!(f.cfg.silence_stop_ms, 1500);
     }
 }

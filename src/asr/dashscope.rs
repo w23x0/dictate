@@ -49,9 +49,17 @@ pub fn request_body(c: &QwenClient, wav: &[u8]) -> serde_json::Value {
 
 pub fn transcribe(c: &QwenClient, wav: &[u8]) -> Result<String> {
     let body = request_body(c, wav);
-    let raw = super::post_json(c, &c.http_endpoint(), &body, &[("X-DashScope-SSE", "disable")])?;
+    let raw = super::post_json(
+        c,
+        &c.http_endpoint(),
+        &body,
+        &[("X-DashScope-SSE", "disable")],
+    )?;
     let v: serde_json::Value = serde_json::from_str(&raw).map_err(|_| {
-        anyhow::anyhow!("响应不是 JSON：{}", raw.chars().take(200).collect::<String>())
+        anyhow::anyhow!(
+            "响应不是 JSON：{}",
+            raw.chars().take(200).collect::<String>()
+        )
     })?;
     // 标准形状是 output.choices[0].message.content[0].text；
     // 有的模型只回 output.text，兜一下。
@@ -97,7 +105,10 @@ mod tests {
     #[test]
     fn audio_family_uses_input_audio_and_format() {
         let b = request_body(&client("qwen-audio-3.1-asr-flash"), b"RIFF");
-        assert_eq!(b["input"]["messages"][0]["content"][0]["type"], "input_audio");
+        assert_eq!(
+            b["input"]["messages"][0]["content"][0]["type"],
+            "input_audio"
+        );
         assert_eq!(b["parameters"]["format"], "wav");
         assert_eq!(b["parameters"]["sample_rate"], "16000");
     }

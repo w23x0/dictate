@@ -1,7 +1,7 @@
 //! 静音门：按 20 ms 帧算能量，裁掉首尾静音；另给"连续静音多久"的判定，
 //! 供热键路径做自动结束。
 
-use crate::agc::{lin_to_db, rms};
+use crate::audio::agc::{lin_to_db, rms};
 
 pub const FRAME_MS: u32 = 20;
 
@@ -9,7 +9,7 @@ pub const FRAME_MS: u32 = 20;
 pub const SPEECH_DBFS: f32 = -45.0;
 
 /// 裁掉首尾静音，两端各留 `pad_ms` 余量。全是静音时返回空切片。
-pub fn trim_silence<'a>(samples: &'a [f32], rate: u32, pad_ms: u32) -> &'a [f32] {
+pub fn trim_silence(samples: &[f32], rate: u32, pad_ms: u32) -> &[f32] {
     let frame = ((rate as f32 * FRAME_MS as f32) / 1000.0) as usize;
     if frame == 0 || samples.len() < frame {
         return samples;
@@ -54,7 +54,7 @@ pub fn trailing_silence_ms(samples: &[f32], rate: u32) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agc::db_to_lin;
+    use crate::audio::agc::db_to_lin;
 
     fn tone(secs: f32, rate: u32) -> Vec<f32> {
         let n = (rate as f32 * secs) as usize;

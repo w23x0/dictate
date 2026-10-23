@@ -41,6 +41,8 @@ pub struct Config {
     pub input_device: Option<String>,
     /// 把每次送到服务端的 WAV 留一份到 `~/.local/share/dictate/last.wav`。
     pub keep_audio: bool,
+    /// 转写完成后怎么交付：`auto`（剪贴板 + 模拟粘贴）/ `clipboard` / `off`。
+    pub paste: String,
 }
 
 impl Default for Config {
@@ -62,6 +64,7 @@ impl Default for Config {
             color: None,
             input_device: None,
             keep_audio: false,
+            paste: "auto".into(),
         }
     }
 }

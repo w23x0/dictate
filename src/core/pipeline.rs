@@ -4,10 +4,10 @@
 
 use anyhow::{bail, Context, Result};
 
-use crate::agc::{Agc, AgcConfig};
+use crate::audio::agc::{Agc, AgcConfig};
 use crate::audio::{self, Downsampler};
-use crate::config::Config;
-use crate::history::{new_id, now_rfc3339, Entry, History};
+use crate::core::config::Config;
+use crate::core::history::{new_id, now_rfc3339, Entry, History};
 
 /// 任意率/声道的 PCM → 16 kHz、去首尾静音、AGC、WAV 字节。
 pub fn prepare_wav(cfg: &Config, pcm: &[f32], rate: u32) -> Result<Vec<u8>> {
@@ -20,18 +20,19 @@ pub fn prepare_wav(cfg: &Config, pcm: &[f32], rate: u32) -> Result<Vec<u8>> {
     let mut processed = mono;
     let mut agc = Agc::new(
         audio::TARGET_RATE,
-        AgcConfig { target_dbfs: cfg.target_rms_dbfs, ..Default::default() },
+        AgcConfig {
+            target_dbfs: cfg.target_rms_dbfs,
+            ..Default::default()
+        },
     );
     agc.process(&mut processed);
 
-    let peak = crate::agc::lin_to_db(
-        processed.iter().fold(0.0f32, |m, s| m.max(s.abs())),
-    );
-    let trimmed = crate::vad::trim_silence(&processed, audio::TARGET_RATE, 100).to_vec();
+    let peak = crate::audio::agc::lin_to_db(processed.iter().fold(0.0f32, |m, s| m.max(s.abs())));
+    let trimmed = crate::audio::vad::trim_silence(&processed, audio::TARGET_RATE, 100).to_vec();
     if trimmed.is_empty() {
         bail!(
             "没有检测到语音：峰值 {peak:.0} dBFS，低于门限 {:.0} dBFS。             检查麦克风（`dictate probe --seconds 3` 看电平，或用 `dictate devices` 换设备）",
-            crate::vad::SPEECH_DBFS
+            crate::audio::vad::SPEECH_DBFS
         );
     }
     let secs = trimmed.len() as f32 / audio::TARGET_RATE as f32;
@@ -44,7 +45,7 @@ pub fn prepare_wav(cfg: &Config, pcm: &[f32], rate: u32) -> Result<Vec<u8>> {
     let voiced = trimmed;
 
     if cfg.keep_audio {
-        let keep = crate::config::status_path()
+        let keep = crate::core::config::status_path()
             .parent()
             .map(|d| d.join("last.wav"))
             .unwrap_or_else(|| std::env::temp_dir().join("last.wav"));
@@ -62,9 +63,7 @@ pub fn prepare_wav(cfg: &Config, pcm: &[f32], rate: u32) -> Result<Vec<u8>> {
 pub fn self_test(cfg: &Config) -> Result<(u64, String)> {
     let samples: Vec<f32> = (0..audio::TARGET_RATE)
         .map(|i| {
-            0.1 * (2.0 * std::f32::consts::PI * 440.0 * i as f32
-                / audio::TARGET_RATE as f32)
-                .sin()
+            0.1 * (2.0 * std::f32::consts::PI * 440.0 * i as f32 / audio::TARGET_RATE as f32).sin()
         })
         .collect();
     let path = std::env::temp_dir().join(format!("dictate-selftest-{}.wav", new_id()));

@@ -2,8 +2,8 @@
 
 use anyhow::Result;
 
-use crate::config::Config;
-use crate::daemon::Daemon;
+use crate::app::daemon::Daemon;
+use crate::core::config::Config;
 
 #[cfg(target_os = "linux")]
 pub fn run(cfg: Config) -> Result<()> {
@@ -13,7 +13,7 @@ pub fn run(cfg: Config) -> Result<()> {
     use tray_icon::{Icon, TrayIconBuilder};
 
     gtk::init().map_err(|e| anyhow::anyhow!("GTK 初始化失败：{e}"))?;
-    crate::desktop::ensure_installed()?;
+    crate::app::desktop::ensure_installed()?;
 
     let mut daemon = Daemon::new(cfg)?;
 
@@ -24,7 +24,7 @@ pub fn run(cfg: Config) -> Result<()> {
     let quit = MenuItem::with_id("quit", "退出", true, None);
     menu.append_items(&[&history, &settings, &sep, &quit])?;
 
-    let icon = Icon::from_rgba(crate::icon::rgba(), 64, 64)?;
+    let icon = Icon::from_rgba(crate::ui::icon::rgba(), 64, 64)?;
     let tray = TrayIconBuilder::new()
         .with_id("dictate")
         .with_menu(Box::new(menu))
@@ -36,10 +36,10 @@ pub fn run(cfg: Config) -> Result<()> {
         while let Ok(ev) = MenuEvent::receiver().try_recv() {
             match ev.id.0.as_str() {
                 "history" => {
-                    let _ = crate::desktop::spawn_terminal("history");
+                    let _ = crate::app::desktop::spawn_terminal("history");
                 }
                 "settings" => {
-                    let _ = crate::desktop::spawn_terminal("settings");
+                    let _ = crate::app::desktop::spawn_terminal("settings");
                 }
                 "quit" => {
                     gtk::main_quit();
@@ -67,7 +67,7 @@ pub fn run(cfg: Config) -> Result<()> {
     use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
     use tray_icon::{Icon, TrayIconBuilder};
 
-    crate::desktop::ensure_installed()?;
+    crate::app::desktop::ensure_installed()?;
     let mut daemon = Daemon::new(cfg)?;
 
     let menu = Menu::new();
@@ -77,7 +77,7 @@ pub fn run(cfg: Config) -> Result<()> {
     let quit = MenuItem::with_id("quit", "退出", true, None);
     menu.append_items(&[&history, &settings, &sep, &quit])?;
 
-    let icon = Icon::from_rgba(crate::icon::rgba(), 64, 64)?;
+    let icon = Icon::from_rgba(crate::ui::icon::rgba(), 64, 64)?;
     let tray = TrayIconBuilder::new()
         .with_id("dictate")
         .with_menu(Box::new(menu))
@@ -90,10 +90,10 @@ pub fn run(cfg: Config) -> Result<()> {
         while let Ok(ev) = MenuEvent::receiver().try_recv() {
             match ev.id.0.as_str() {
                 "history" => {
-                    let _ = crate::desktop::spawn_terminal("history");
+                    let _ = crate::app::desktop::spawn_terminal("history");
                 }
                 "settings" => {
-                    let _ = crate::desktop::spawn_terminal("settings");
+                    let _ = crate::app::desktop::spawn_terminal("settings");
                 }
                 "quit" => return Ok(()),
                 _ => {}

@@ -20,7 +20,7 @@ pub fn desktop_path() -> Option<PathBuf> {
 pub fn ensure_installed() -> Result<()> {
     let exe = std::env::current_exe()?;
     if let Some(icon) = icon_dir() {
-        crate::icon::write_png(&icon.join("dictate.png"))?;
+        crate::ui::icon::write_png(&icon.join("dictate.png"))?;
     }
     let Some(path) = desktop_path() else {
         return Ok(());
@@ -110,7 +110,9 @@ pub fn terminal_candidates(exe: &str, sub: &str) -> Vec<Vec<String>> {
         }
     }
     // 用户当前终端优先
-    let program = std::env::var("TERM_PROGRAM").unwrap_or_default().to_ascii_lowercase();
+    let program = std::env::var("TERM_PROGRAM")
+        .unwrap_or_default()
+        .to_ascii_lowercase();
     if program.contains("ghostty") {
         out.push(vec!["ghostty".into(), "-e".into(), exe.into(), sub.into()]);
     }
@@ -118,11 +120,22 @@ pub fn terminal_candidates(exe: &str, sub: &str) -> Vec<Vec<String>> {
         vec!["ghostty".into(), "-e".into(), exe.into(), sub.into()],
         vec!["kitty".into(), exe.into(), sub.into()],
         vec!["alacritty".into(), "-e".into(), exe.into(), sub.into()],
-        vec!["wezterm".into(), "start".into(), "--".into(), exe.into(), sub.into()],
+        vec![
+            "wezterm".into(),
+            "start".into(),
+            "--".into(),
+            exe.into(),
+            sub.into(),
+        ],
         vec!["konsole".into(), "-e".into(), exe.into(), sub.into()],
         vec!["xfce4-terminal".into(), "-x".into(), exe.into(), sub.into()],
         vec!["gnome-terminal".into(), "--".into(), exe.into(), sub.into()],
-        vec!["x-terminal-emulator".into(), "-e".into(), exe.into(), sub.into()],
+        vec![
+            "x-terminal-emulator".into(),
+            "-e".into(),
+            exe.into(),
+            sub.into(),
+        ],
     ]);
     out
 }

@@ -36,7 +36,11 @@ impl Theme {
     pub fn from_bg(bg: (u8, u8, u8)) -> Self {
         let luma = 0.2126 * bg.0 as f32 + 0.7152 * bg.1 as f32 + 0.0722 * bg.2 as f32;
         let light = luma > 127.0;
-        let fg = if light { (0x1a, 0x1c, 0x20) } else { (0xf2, 0xf3, 0xf5) };
+        let fg = if light {
+            (0x1a, 0x1c, 0x20)
+        } else {
+            (0xf2, 0xf3, 0xf5)
+        };
         Self {
             mode: if light { Mode::Light } else { Mode::Dark },
             accent: if light {
@@ -102,7 +106,11 @@ impl Theme {
 /// `COLORFGBG` 形如 `15;0`（fg;bg），背景 0–6/8 算深色，7/9–15 算浅色。
 pub fn from_colorfgbg(v: Option<&str>) -> Option<Mode> {
     let bg = v?.rsplit(';').next()?.trim().parse::<u8>().ok()?;
-    Some(if bg == 7 || bg >= 9 { Mode::Light } else { Mode::Dark })
+    Some(if bg == 7 || bg >= 9 {
+        Mode::Light
+    } else {
+        Mode::Dark
+    })
 }
 
 /// 从 OSC 11 的回包里取背景色：`\x1b]11;rgb:3b1a/2b2b/2b2b\x1b\\`
@@ -116,7 +124,11 @@ pub fn parse_osc11_rgb(reply: &[u8]) -> Option<(u8, u8, u8)> {
         let hi = u16::from_str_radix(p.get(..2)?, 16).ok()?;
         Some(hi as u8)
     };
-    Some((take(parts.next()?)?, take(parts.next()?)?, take(parts.next()?)?))
+    Some((
+        take(parts.next()?)?,
+        take(parts.next()?)?,
+        take(parts.next()?)?,
+    ))
 }
 
 /// 亮度判定（测试用）。
@@ -124,7 +136,11 @@ pub fn parse_osc11_rgb(reply: &[u8]) -> Option<(u8, u8, u8)> {
 pub fn parse_osc11(reply: &[u8]) -> Option<Mode> {
     let (r, g, b) = parse_osc11_rgb(reply)?;
     let luma = 0.2126 * r as f32 + 0.7152 * g as f32 + 0.0722 * b as f32;
-    Some(if luma > 127.0 { Mode::Light } else { Mode::Dark })
+    Some(if luma > 127.0 {
+        Mode::Light
+    } else {
+        Mode::Dark
+    })
 }
 
 /// 问终端背景色，最多等 150 ms；拿不到就算了。
@@ -136,7 +152,11 @@ fn query_terminal_background() -> Option<(u8, u8, u8)> {
     out.write_all(b"\x1b]11;?\x1b\\").ok()?;
     out.flush().ok()?;
 
-    let mut pfd = libc::pollfd { fd: 0, events: libc::POLLIN, revents: 0 };
+    let mut pfd = libc::pollfd {
+        fd: 0,
+        events: libc::POLLIN,
+        revents: 0,
+    };
     if unsafe { libc::poll(&mut pfd, 1, 150) } <= 0 {
         return None;
     }
@@ -176,8 +196,14 @@ mod tests {
             parse_osc11_rgb(b"\x1b]11;rgb:ffff/ffff/ffff\x1b\\"),
             Some((255, 255, 255))
         );
-        assert_eq!(parse_osc11_rgb(b"\x1b]11;rgb:3b1a/2b2b/2b2b\x07"), Some((0x3b, 0x2b, 0x2b)));
-        assert_eq!(parse_osc11(b"\x1b]11;rgb:3b1a/2b2b/2b2b\x07"), Some(Mode::Dark));
+        assert_eq!(
+            parse_osc11_rgb(b"\x1b]11;rgb:3b1a/2b2b/2b2b\x07"),
+            Some((0x3b, 0x2b, 0x2b))
+        );
+        assert_eq!(
+            parse_osc11(b"\x1b]11;rgb:3b1a/2b2b/2b2b\x07"),
+            Some(Mode::Dark)
+        );
     }
 
     #[test]

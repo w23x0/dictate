@@ -43,7 +43,7 @@ async fn run(c: &QwenClient, wav: &[u8]) -> Result<String> {
         .map_err(|e| anyhow!("连接 {url} 失败：{e}"))?;
 
     let task_id = uuid::Uuid::new_v4().simple().to_string();
-    ws.send(Message::Text(run_task(&task_id, c).to_string().into()))
+    ws.send(Message::Text(run_task(&task_id, c).to_string()))
         .await?;
 
     // 1) 等 task-started
@@ -53,9 +53,11 @@ async fn run(c: &QwenClient, wav: &[u8]) -> Result<String> {
             .await
             .ok_or_else(|| anyhow!("连接在 task-started 之前关闭"))?
             .map_err(|e| anyhow!("WebSocket 读失败：{e}"))?;
-        let Some(text) = msg.to_text().ok() else { continue };
-        let v: Value = serde_json::from_str(text)
-            .map_err(|e| anyhow!("服务端帧不是 JSON：{e}：{text}"))?;
+        let Some(text) = msg.to_text().ok() else {
+            continue;
+        };
+        let v: Value =
+            serde_json::from_str(text).map_err(|e| anyhow!("服务端帧不是 JSON：{e}：{text}"))?;
         match event(&v) {
             Some("task-started") => break,
             Some("task-failed") | Some("task-finished") => return Err(failed(&v)),
@@ -65,10 +67,10 @@ async fn run(c: &QwenClient, wav: &[u8]) -> Result<String> {
 
     // 2) 发音频（已录完的整段，按 100 ms 切片，不额外等待）
     for chunk in wav.chunks(CHUNK) {
-        ws.send(Message::Binary(chunk.to_vec().into())).await?;
+        ws.send(Message::Binary(chunk.to_vec())).await?;
     }
     // 3) 收尾
-    ws.send(Message::Text(finish_task(&task_id).to_string().into()))
+    ws.send(Message::Text(finish_task(&task_id).to_string()))
         .await?;
 
     // 4) 收结果，直到 task-finished
@@ -80,14 +82,19 @@ async fn run(c: &QwenClient, wav: &[u8]) -> Result<String> {
             .await
             .ok_or_else(|| anyhow!("连接在 task-finished 之前关闭"))?
             .map_err(|e| anyhow!("WebSocket 读失败：{e}"))?;
-        let Some(text) = msg.to_text().ok() else { continue };
-        let v: Value = serde_json::from_str(text)
-            .map_err(|e| anyhow!("服务端帧不是 JSON：{e}：{text}"))?;
+        let Some(text) = msg.to_text().ok() else {
+            continue;
+        };
+        let v: Value =
+            serde_json::from_str(text).map_err(|e| anyhow!("服务端帧不是 JSON：{e}：{text}"))?;
         match event(&v) {
             Some("result-generated") => {
                 if let Some(s) = v.pointer("/payload/output/sentence") {
                     if let Some(t) = s.get("text").and_then(|t| t.as_str()) {
-                        if s.get("sentence_end").and_then(|b| b.as_bool()).unwrap_or(true) {
+                        if s.get("sentence_end")
+                            .and_then(|b| b.as_bool())
+                            .unwrap_or(true)
+                        {
                             finals.push(t.to_string());
                             partial.clear();
                         } else {
@@ -103,7 +110,11 @@ async fn run(c: &QwenClient, wav: &[u8]) -> Result<String> {
     }
     let _ = ws.close(None).await;
 
-    let text = if finals.is_empty() { partial } else { finals.concat() };
+    let text = if finals.is_empty() {
+        partial
+    } else {
+        finals.concat()
+    };
     Ok(text.trim().to_string())
 }
 

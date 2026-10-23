@@ -37,7 +37,13 @@ pub struct Spec {
 impl Spec {
     /// `ctrl+space` / `f9` / `alt+shift+d` / `super+k`
     pub fn parse(text: &str) -> Result<Self> {
-        let mut spec = Spec { ctrl: false, alt: false, shift: false, meta: false, key: Key::Space };
+        let mut spec = Spec {
+            ctrl: false,
+            alt: false,
+            shift: false,
+            meta: false,
+            key: Key::Space,
+        };
         let mut key: Option<Key> = None;
         for raw in text.split('+') {
             let part = raw.trim().to_ascii_lowercase();
@@ -58,7 +64,8 @@ impl Spec {
                     let c = chars.next().unwrap();
                     if chars.next().is_some() {
                         // f1..f12
-                        if let Some(n) = other.strip_prefix('f').and_then(|n| n.parse::<u8>().ok()) {
+                        if let Some(n) = other.strip_prefix('f').and_then(|n| n.parse::<u8>().ok())
+                        {
                             if (1..=12).contains(&n) {
                                 key = Some(Key::F(n));
                                 continue;
@@ -111,13 +118,19 @@ mod tests {
     fn parses_combinations() {
         assert_eq!(
             Spec::parse("ctrl+space").unwrap(),
-            Spec { ctrl: true, alt: false, shift: false, meta: false, key: Key::Space }
+            Spec {
+                ctrl: true,
+                alt: false,
+                shift: false,
+                meta: false,
+                key: Key::Space
+            }
         );
         assert_eq!(Spec::parse("F9").unwrap().key, Key::F(9));
         let s = Spec::parse("alt+shift+d").unwrap();
         assert!(s.alt && s.shift && !s.ctrl);
         assert_eq!(s.key, Key::Char('d'));
-        assert_eq!(Spec::parse("super+k").unwrap().meta, true);
+        assert!(Spec::parse("super+k").unwrap().meta);
         assert_eq!(Spec::parse("7").unwrap().key, Key::Digit(7));
     }
 

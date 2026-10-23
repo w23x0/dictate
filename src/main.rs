@@ -6,29 +6,23 @@
 //! * `record [--seconds N]`               录一段并直接转写
 //! * `history`                            终端历史窗口
 
-mod agc;
+mod app;
 mod asr;
 mod audio;
-mod config;
-mod daemon;
-mod desktop;
-mod history;
+mod core;
 mod hotkey;
-mod icon;
-mod pipeline;
-mod settings_ui;
-mod theme;
-mod tray;
-mod tui;
-mod vad;
+mod ui;
 
 use std::path::PathBuf;
 
 use anyhow::{bail, Result};
 
-use agc::{lin_to_db, rms, Agc, AgcConfig};
+use app::{desktop, inject, tray};
+use audio::agc::{lin_to_db, rms, Agc, AgcConfig};
 use audio::Downsampler;
-use history::History;
+use core::history::History;
+use core::{config, pipeline};
+use ui::{settings_ui, tui};
 
 fn main() {
     if let Err(e) = run() {
@@ -58,6 +52,15 @@ fn run() -> Result<()> {
         "transcribe" => cmd_transcribe(&args[1..]),
         "record" => cmd_record(&args[1..]),
         "doctor" => cmd_doctor(),
+        "install-desktop" => {
+            desktop::ensure_installed()?;
+            println!("已写入应用入口与图标（~/.local/share/applications、icons）");
+            Ok(())
+        }
+        "version" | "--version" | "-V" => {
+            println!("dictate {}", env!("CARGO_PKG_VERSION"));
+            Ok(())
+        }
         "devices" => {
             for line in audio::input_names() {
                 println!("{line}");
@@ -143,6 +146,7 @@ fn cmd_doctor() -> Result<()> {
     if let Some(style) = style {
         println!("报文形状：{}", style.name());
     }
+    println!("交付能力：{}", inject::capabilities());
     println!(
         "区域 key：{}",
         match cfg.api_key() {
@@ -197,10 +201,14 @@ fn cmd_probe(args: &[String]) -> Result<()> {
     let before = lin_to_db(rms(&pcm));
     let peak_in = lin_to_db(pcm.iter().fold(0.0f32, |m, s| m.max(s.abs())));
     if peak_in < -70.0 {
-        println!("⚠ 这个设备没有任何信号（峰值 {peak_in:.0} dBFS）——通常是环回设备或麦克风被静音。");
-        println!("  `dictate devices` 看有哪些输入；`pactl info | grep 'Default Source'` 看系统默认源。");
+        println!(
+            "⚠ 这个设备没有任何信号（峰值 {peak_in:.0} dBFS）——通常是环回设备或麦克风被静音。"
+        );
+        println!(
+            "  `dictate devices` 看有哪些输入；`pactl info | grep 'Default Source'` 看系统默认源。"
+        );
     }
-    let trimmed = vad::trim_silence(&pcm, audio::TARGET_RATE, 100);
+    let trimmed = audio::vad::trim_silence(&pcm, audio::TARGET_RATE, 100);
     let mut voiced = trimmed.to_vec();
     let mut agc = Agc::new(
         audio::TARGET_RATE,
@@ -257,4 +265,3 @@ fn cmd_record(args: &[String]) -> Result<()> {
     println!("{text}");
     Ok(())
 }
-

@@ -82,8 +82,13 @@ fn openai_shape_end_to_end() {
     assert_eq!(out, "你好，世界。");
 
     let req = srv.join().unwrap();
-    assert!(req.starts_with("POST /compatible-mode/v1/chat/completions"), "{req}");
-    assert!(req.to_lowercase().contains("authorization: bearer test-key"));
+    assert!(
+        req.starts_with("POST /compatible-mode/v1/chat/completions"),
+        "{req}"
+    );
+    assert!(req
+        .to_lowercase()
+        .contains("authorization: bearer test-key"));
     let body: Value = serde_json::from_str(req.split("\r\n\r\n").nth(1).unwrap()).unwrap();
     assert_eq!(body["model"], "qwen3-asr-flash");
     assert!(body["messages"][0]["content"][0]["input_audio"]["data"]
@@ -108,7 +113,10 @@ fn dashscope_sync_shape_end_to_end() {
     );
     assert!(req.contains("x-dashscope-sse: disable"));
     let body: Value = serde_json::from_str(req.split("\r\n\r\n").nth(1).unwrap()).unwrap();
-    assert_eq!(body["input"]["messages"][0]["content"][0]["type"], "input_audio");
+    assert_eq!(
+        body["input"]["messages"][0]["content"][0]["type"],
+        "input_audio"
+    );
     assert_eq!(body["parameters"]["format"], "wav");
 }
 
@@ -133,7 +141,8 @@ fn ws_server() -> (String, std::thread::JoinHandle<Vec<String>>) {
                 seen.push(t.to_string());
             }
             ws.send(tokio_tungstenite::tungstenite::Message::Text(
-                json!({"header":{"event":"task-started","task_id":"t"}}).to_string().into(),
+                json!({"header":{"event":"task-started","task_id":"t"}})
+                    .to_string(),
             ))
             .await
             .unwrap();
@@ -158,14 +167,14 @@ fn ws_server() -> (String, std::thread::JoinHandle<Vec<String>>) {
                 ws.send(tokio_tungstenite::tungstenite::Message::Text(
                     json!({"header":{"event":"result-generated"},
                            "payload":{"output":{"sentence":{"text":text,"sentence_end":end}}}})
-                    .to_string()
-                    .into(),
+                    .to_string(),
                 ))
                 .await
                 .unwrap();
             }
             ws.send(tokio_tungstenite::tungstenite::Message::Text(
-                json!({"header":{"event":"task-finished"}}).to_string().into(),
+                json!({"header":{"event":"task-finished"}})
+                    .to_string(),
             ))
             .await
             .unwrap();

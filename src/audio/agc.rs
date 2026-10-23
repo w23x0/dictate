@@ -75,7 +75,11 @@ impl Agc {
 
             if rms > self.floor && rms > 0.0 {
                 let desired = (self.target / rms).clamp(0.5, self.max_gain);
-                let coef = if desired < self.gain { self.attack } else { self.release };
+                let coef = if desired < self.gain {
+                    self.attack
+                } else {
+                    self.release
+                };
                 self.gain += (desired - self.gain) * coef;
             }
 
@@ -134,9 +138,7 @@ mod tests {
     fn sine(amp: f32, freq: f32, rate: u32, secs: f32) -> Vec<f32> {
         let n = (rate as f32 * secs) as usize;
         (0..n)
-            .map(|i| {
-                amp * (2.0 * std::f32::consts::PI * freq * i as f32 / rate as f32).sin()
-            })
+            .map(|i| amp * (2.0 * std::f32::consts::PI * freq * i as f32 / rate as f32).sin())
             .collect()
     }
 

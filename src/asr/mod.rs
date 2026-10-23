@@ -22,7 +22,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use reqwest::Url;
 use serde_json::Value;
 
-use crate::config::Config;
+use crate::core::config::Config;
 
 pub struct Transcript {
     pub text: String,
@@ -84,14 +84,20 @@ impl QwenClient {
             Style::DashScope => dashscope::transcribe(self, wav)?,
             Style::Ws => ws::transcribe(self, wav)?,
         };
-        Ok(Transcript { text, latency_ms: started.elapsed().as_millis() as u64 })
+        Ok(Transcript {
+            text,
+            latency_ms: started.elapsed().as_millis() as u64,
+        })
     }
 
     pub fn http_endpoint(&self) -> String {
         match self.style {
             Style::OpenAi => format!("{}/compatible-mode/v1/chat/completions", self.base),
             Style::DashScope => {
-                format!("{}/api/v1/services/aigc/multimodal-generation/generation", self.base)
+                format!(
+                    "{}/api/v1/services/aigc/multimodal-generation/generation",
+                    self.base
+                )
             }
             Style::Ws => format!("{}/api-ws/v1/inference", self.base),
         }
@@ -234,8 +240,14 @@ mod tests {
     #[test]
     fn style_inference_covers_model_families() {
         assert_eq!(pick_style("qwen3-asr-flash", None).unwrap(), Style::OpenAi);
-        assert_eq!(pick_style("qwen-audio-3.1-asr-flash", None).unwrap(), Style::DashScope);
-        assert_eq!(pick_style("qwen-audio-3.0-asr-flash", None).unwrap(), Style::DashScope);
+        assert_eq!(
+            pick_style("qwen-audio-3.1-asr-flash", None).unwrap(),
+            Style::DashScope
+        );
+        assert_eq!(
+            pick_style("qwen-audio-3.0-asr-flash", None).unwrap(),
+            Style::DashScope
+        );
         assert_eq!(
             pick_style("qwen-audio-3.1-asr-flash-message", None).unwrap(),
             Style::Ws
@@ -244,20 +256,29 @@ mod tests {
             pick_style("qwen-audio-3.1-asr-flash-streaming", None).unwrap(),
             Style::Ws
         );
-        assert_eq!(pick_style("qwen3-asr-flash-realtime", None).unwrap(), Style::Ws);
+        assert_eq!(
+            pick_style("qwen3-asr-flash-realtime", None).unwrap(),
+            Style::Ws
+        );
         assert!(pick_style("qwen3-asr-flash-filetrans", None).is_err());
     }
 
     #[test]
     fn explicit_style_wins() {
-        assert_eq!(pick_style("qwen3-asr-flash", Some("dashscope")).unwrap(), Style::DashScope);
+        assert_eq!(
+            pick_style("qwen3-asr-flash", Some("dashscope")).unwrap(),
+            Style::DashScope
+        );
         assert!(pick_style("qwen3-asr-flash", Some("nope")).is_err());
     }
 
     #[test]
     fn base_normalization_strips_known_suffixes() {
         let b = normalize_base("https://ws-45tgzezfnpme08ey.cn-beijing.maas.aliyuncs.com").unwrap();
-        assert_eq!(b, "https://ws-45tgzezfnpme08ey.cn-beijing.maas.aliyuncs.com");
+        assert_eq!(
+            b,
+            "https://ws-45tgzezfnpme08ey.cn-beijing.maas.aliyuncs.com"
+        );
         let b = normalize_base("https://dashscope.aliyuncs.com/compatible-mode/v1/").unwrap();
         assert_eq!(b, "https://dashscope.aliyuncs.com");
         assert!(normalize_base("not a url").is_err());
@@ -289,7 +310,10 @@ mod tests {
         let body = r#"{"request_id":"x","code":"InvalidParameter","message":"generate asr words failed. ASR_RESPONSE_HAVE_NO_WORDS"}"#;
         let msg = humanize_error(body).unwrap();
         assert!(msg.contains("没从音频里听出任何词"), "{msg}");
-        assert!(msg.contains("ASR_RESPONSE_HAVE_NO_WORDS"), "要保留原始错误码");
+        assert!(
+            msg.contains("ASR_RESPONSE_HAVE_NO_WORDS"),
+            "要保留原始错误码"
+        );
     }
 
     #[test]

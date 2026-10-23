@@ -6,8 +6,8 @@ use std::time::Instant;
 use anyhow::Result;
 
 use crate::audio::Capture;
-use crate::config::Config;
-use crate::history::History;
+use crate::core::config::Config;
+use crate::core::history::History;
 use crate::hotkey::{self, HotkeyEvent};
 use crate::pipeline;
 
@@ -18,17 +18,25 @@ pub enum Phase {
     Transcribing(Instant),
 }
 
+/// 转写线程 → 主循环的结果通道。
+type Worker = (
+    Sender<Result<String, String>>,
+    Receiver<Result<String, String>>,
+);
+
 pub struct Daemon {
     cfg: Config,
     published: String,
     capture: Capture,
     hk: Receiver<HotkeyEvent>,
-    worker: (Sender<Result<String, String>>, Receiver<Result<String, String>>),
+    worker: Worker,
     pub phase: Phase,
     /// 本次录音的开始时刻（判断"误触"用）
     started: Option<Instant>,
     pub quit: bool,
     pub last_error: Option<String>,
+    /// 最近一次交付方式（托盘提示用）
+    pub paste_note: Option<String>,
     pub last_text: Option<String>,
 }
 
@@ -48,6 +56,7 @@ impl Daemon {
             started: None,
             quit: false,
             last_error: None,
+            paste_note: None,
             last_text: None,
         })
     }
@@ -69,7 +78,7 @@ impl Daemon {
         if body == self.published {
             return;
         }
-        let path = crate::config::status_path();
+        let path = crate::core::config::status_path();
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir).ok();
         }
@@ -123,7 +132,7 @@ impl Daemon {
                 let secs = pcm.len() as f32 / rate as f32;
                 self.phase = Phase::Transcribing(Instant::now());
                 let cfg = self.cfg.clone();
-                let hist = History::new(crate::config::history_path());
+                let hist = History::new(crate::core::config::history_path());
                 let tx = self.worker.0.clone();
                 std::thread::spawn(move || {
                     let out = pipeline::prepare_wav(&cfg, &pcm, rate)
@@ -141,7 +150,7 @@ impl Daemon {
 
     /// 读一次控制文件（终端视图 / 外部脚本下命令）。
     fn poll_control(&mut self) {
-        let path = crate::config::control_path();
+        let path = crate::core::config::control_path();
         let Ok(cmd) = std::fs::read_to_string(&path) else {
             return;
         };
@@ -165,7 +174,7 @@ impl Daemon {
                 (HotkeyEvent::Press, Phase::Idle) => {
                     // 每次开录前重读配置：这样 `dictate settings` 保存后不用重启托盘进程
                     //（热键本身除外，它在启动时就绑定了）。
-                    if let Ok(cfg) = crate::config::load() {
+                    if let Ok(cfg) = crate::core::config::load() {
                         self.cfg = cfg;
                     }
                     self.start();
@@ -179,8 +188,20 @@ impl Daemon {
             self.phase = Phase::Idle;
             match out {
                 Ok(text) => {
-                    self.last_text = Some(text);
-                    self.last_error = None;
+                    // 原版逻辑：识别完直接送到当前焦点窗口（剪贴板 + 模拟粘贴）
+                    let mode = crate::app::inject::Mode::parse(&self.cfg.paste);
+                    match crate::app::inject::deliver(&text, mode) {
+                        Ok(how) => {
+                            self.last_text = Some(text);
+                            self.paste_note = Some(how);
+                            self.last_error = None;
+                        }
+                        Err(e) => {
+                            self.last_text = Some(text);
+                            self.paste_note = None;
+                            self.last_error = Some(format!("交付失败：{e}"));
+                        }
+                    }
                 }
                 Err(e) => self.last_error = Some(e),
             }
@@ -190,7 +211,11 @@ impl Daemon {
         match self.phase {
             Phase::Idle => match (&self.last_error, &self.last_text) {
                 (Some(e), _) => format!("dictate — 失败：{}", truncate(e, 60)),
-                (None, Some(t)) => format!("dictate — {}", truncate(t, 60)),
+                (None, Some(t)) => format!(
+                    "dictate — {}（{}）",
+                    truncate(t, 50),
+                    self.paste_note.as_deref().unwrap_or("已识别")
+                ),
                 (None, None) => "dictate — 就绪".to_string(),
             },
             Phase::Recording(t) => {
