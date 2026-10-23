@@ -66,6 +66,41 @@ pub fn acquire_single_instance() -> Option<std::fs::File> {
 
 /// 终端模拟器的启动命令。优先用用户自己正在用的那个（`TERM_PROGRAM` / `TERMINAL`），
 /// 否则按常见顺序找——**不能**默认起 gnome-terminal，那会在别人的 Ghostty 之外再开一个窗口。
+/// 守护进程是否在跑（锁被别处持有）。
+pub fn daemon_running() -> bool {
+    let Some(dir) = dirs::data_dir().map(|d| d.join("dictate")) else {
+        return false;
+    };
+    let Ok(f) = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(dir.join("daemon.lock"))
+    else {
+        return false;
+    };
+    f.try_lock().is_err() // 拿不到锁 = 别人持有 = 在跑
+}
+
+/// 后台拉起守护进程（新会话组，父进程退出也不影响它）。
+pub fn spawn_daemon() -> Result<()> {
+    use std::process::{Command, Stdio};
+    let exe = std::env::current_exe()?;
+    let mut cmd = Command::new(exe);
+    cmd.arg("tray")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
+    cmd.spawn()?;
+    Ok(())
+}
+
 pub fn terminal_candidates(exe: &str, sub: &str) -> Vec<Vec<String>> {
     let mut out: Vec<Vec<String>> = Vec::new();
     if let Ok(t) = std::env::var("TERMINAL") {

@@ -83,6 +83,14 @@ pub fn config_path() -> PathBuf {
         .join("config.toml")
 }
 
+/// 守护进程写给终端视图看的状态文件。
+pub fn status_path() -> PathBuf {
+    dirs::data_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("dictate")
+        .join("status.json")
+}
+
 pub fn history_path() -> PathBuf {
     dirs::data_dir()
         .unwrap_or_else(|| PathBuf::from("."))

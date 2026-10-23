@@ -4,7 +4,6 @@
 //! * [`run_live`]：热键守护 + 历史（`dictate run`），录音/转写状态显示在顶栏。
 
 use std::io;
-use std::sync::mpsc::{channel, Receiver, Sender};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
@@ -23,8 +22,6 @@ use ratatui::Terminal;
 use crate::config::Config;
 use crate::history::{Entry, History};
 use crate::theme::Theme;
-use crate::hotkey::{self, HotkeyEvent};
-use crate::pipeline;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Phase {
@@ -100,33 +97,33 @@ pub fn run(history: History) -> Result<()> {
     // 配色要问终端背景色，必须在 raw mode 之后问，否则回包会被回显
     with_terminal(|term| {
         let theme = Theme::resolve(crate::config::load().ok().and_then(|c| c.theme).as_deref());
-        event_loop(term, &mut App::new(history, theme), None)
+        event_loop(term, &mut App::new(history, theme))
     })
 }
 
 /// 热键守护：一边听热键，一边显示历史。
 pub fn run_live(cfg: Config, history: History) -> Result<()> {
-    let spec = hotkey::Spec::parse(&cfg.hotkey)?;
-    let (tx, hk_rx) = channel();
-    hotkey::spawn(spec, tx, false)?;
-    let capture = crate::audio::spawn_capture()?;
-
     let theme_cfg = cfg.theme.clone();
-    let mut app = App::new(history, Theme::dark());
-    app.theme = Theme::resolve(theme_cfg.as_deref());
-    app.subtitle = format!("{} · {}", cfg.hotkey, cfg.model);
-    app.status = "等待热键…".to_string();
-    let mut live = Live { cfg, capture, hk: hk_rx, worker: channel(), busy: false };
-
-    with_terminal(|term| event_loop(term, &mut app, Some(&mut live)))
+    let subtitle = format!("{} · {}", cfg.hotkey, cfg.model);
+    with_terminal(|term| {
+        let theme = Theme::resolve(theme_cfg.as_deref());
+        let mut app = App::new(history, theme);
+        app.subtitle = subtitle;
+        attach_loop(term, &mut app)
+    })
 }
 
-struct Live {
-    cfg: Config,
-    capture: crate::audio::Capture,
-    hk: Receiver<HotkeyEvent>,
-    worker: (Sender<Result<String, String>>, Receiver<Result<String, String>>),
-    busy: bool,
+/// 守护进程写的状态文件。终端视图只读它，不碰麦克风与热键。
+#[derive(serde::Deserialize, Default)]
+struct StatusFile {
+    #[serde(default)]
+    phase: String,
+    #[serde(default)]
+    since_ms: u64,
+    #[serde(default)]
+    text: Option<String>,
+    #[serde(default)]
+    error: Option<String>,
 }
 
 fn with_terminal<F>(f: F) -> Result<()>
@@ -144,164 +141,150 @@ where
     res
 }
 
-fn event_loop(
-    term: &mut Terminal<CrosstermBackend<io::Stdout>>,
-    app: &mut App,
-    mut live: Option<&mut Live>,
-) -> Result<()> {
+/// 把守护进程的状态文件映射成本地相位（用时间差还原已过去多久）。
+fn apply_status(app: &mut App) {
+    let path = crate::config::status_path();
+    let Ok(body) = std::fs::read_to_string(&path) else {
+        app.phase = Phase::Idle;
+        app.status = "守护进程没在跑 —— 先执行 dictate".into();
+        return;
+    };
+    let Ok(st) = serde_json::from_str::<StatusFile>(&body) else {
+        return;
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    let elapsed = Duration::from_millis(now.saturating_sub(st.since_ms));
+    let at = Instant::now().checked_sub(elapsed).unwrap_or_else(Instant::now);
+    app.phase = match st.phase.as_str() {
+        "recording" => Phase::Recording(at),
+        "transcribing" => Phase::Transcribing(at),
+        _ => Phase::Idle,
+    };
+    app.status = match (&st.error, &st.text) {
+        (Some(e), _) => format!("失败：{e}"),
+        (None, Some(t)) => format!("完成：{}", t.chars().take(40).collect::<String>()),
+        (None, None) => String::new(),
+    };
+}
+
+/// 附着模式：只画，不抢热键/麦克风。
+fn attach_loop(term: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> Result<()> {
+    let mut last_len = usize::MAX;
     loop {
-        if let Some(live) = live.as_deref_mut() {
-            pump_live(app, live)?;
+        apply_status(app);
+        let len = std::fs::metadata(crate::config::history_path())
+            .map(|m| m.len() as usize)
+            .unwrap_or(0);
+        if len != last_len {
+            last_len = len;
+            app.reload();
         }
         term.draw(|f| draw(f, app))?;
 
+        if !event::poll(Duration::from_millis(100))? {
+            continue;
+        }
+        let Event::Key(k) = event::read()? else { continue };
+        if k.kind == KeyEventKind::Press && handle_key(app, &k)? {
+            return Ok(());
+        }
+    }
+}
+
+/// 只看历史（`dictate history`），不读状态文件。
+fn event_loop(term: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> Result<()> {
+    loop {
+        term.draw(|f| draw(f, app))?;
         if !event::poll(Duration::from_millis(50))? {
             continue;
         }
-        let Event::Key(k) = event::read()? else {
-            continue;
-        };
-        if k.kind != KeyEventKind::Press {
-            continue;
+        let Event::Key(k) = event::read()? else { continue };
+        if k.kind == KeyEventKind::Press && handle_key(app, &k)? {
+            return Ok(());
         }
-        if app.searching {
-            match k.code {
-                KeyCode::Esc => {
-                    app.searching = false;
-                    app.query.clear();
-                    app.refilter();
-                }
-                KeyCode::Enter => app.searching = false,
-                KeyCode::Backspace => {
-                    app.query.pop();
-                    app.refilter();
-                }
-                KeyCode::Char(c) => {
-                    app.query.push(c);
-                    app.refilter();
-                }
-                _ => {}
-            }
-            continue;
-        }
-        // 带修饰键的按键一律不当作动作：Ctrl+D 是终端 EOF、Ctrl+C 是中断，
-        // 把裸字母当动作时**必须**确认没有修饰键，否则会误删。
-        let plain = k.modifiers.is_empty() || k.modifiers == KeyModifiers::SHIFT;
-        if k.modifiers.contains(KeyModifiers::CONTROL) {
-            match k.code {
-                KeyCode::Char('c') | KeyCode::Char('d') => return Ok(()),
-                _ => continue,
-            }
-        }
+    }
+}
+
+/// 处理一个按键。返回 true = 退出。
+fn handle_key(app: &mut App, k: &crossterm::event::KeyEvent) -> Result<bool> {
+    if app.searching {
         match k.code {
-            KeyCode::Esc => return Ok(()),
-            KeyCode::Up => app.selected = app.selected.saturating_sub(1),
-            KeyCode::Down => {
-                if app.selected + 1 < app.shown.len() {
-                    app.selected += 1;
-                }
-            }
-            KeyCode::Char('q') if plain => return Ok(()),
-            KeyCode::Char('k') if plain => app.selected = app.selected.saturating_sub(1),
-            KeyCode::Char('j') if plain => {
-                if app.selected + 1 < app.shown.len() {
-                    app.selected += 1;
-                }
-            }
-            KeyCode::Char('/') if plain => {
-                app.searching = true;
+            KeyCode::Esc => {
+                app.searching = false;
                 app.query.clear();
                 app.refilter();
             }
-            KeyCode::Enter => {
-                if let Some(e) = app.current() {
-                    let text = e.text.clone();
-                    print!("{}", osc52(&text));
-                    app.status = format!("已复制 {} 字", text.chars().count());
-                }
+            KeyCode::Enter => app.searching = false,
+            KeyCode::Backspace => {
+                app.query.pop();
+                app.refilter();
             }
-            KeyCode::Char('d') if plain => {
-                if let Some(e) = app.current() {
-                    let id = e.id.clone();
-                    app.history.delete(&id)?;
-                    app.reload();
-                    app.status = "已删除一条".into();
-                }
-            }
-            KeyCode::Char('c') if plain => {
-                app.history.clear()?;
-                app.reload();
-                app.status = "已清空".into();
-            }
-            KeyCode::Char('r') if plain => {
-                app.reload();
-                app.status = "已刷新".into();
+            KeyCode::Char(c) => {
+                app.query.push(c);
+                app.refilter();
             }
             _ => {}
         }
+        return Ok(false);
     }
-}
-
-/// 热键 → 动作。纯函数，便于把状态机钉在测试里。
-#[derive(Debug, PartialEq, Eq)]
-enum Action {
-    Start,
-    Stop,
-    Ignore,
-}
-
-fn on_hotkey(ev: HotkeyEvent, phase: Phase) -> Action {
-    match (ev, phase) {
-        (HotkeyEvent::Press, Phase::Idle) => Action::Start,
-        (HotkeyEvent::Release, Phase::Recording(_)) => Action::Stop,
-        _ => Action::Ignore,
-    }
-}
-
-/// 处理热键与转写结果，更新状态机。
-fn pump_live(app: &mut App, live: &mut Live) -> Result<()> {
-    while let Ok(ev) = live.hk.try_recv() {
-        match on_hotkey(ev, app.phase) {
-            Action::Start => {
-                if let Err(e) = live.capture.start(live.cfg.max_seconds) {
-                    app.status = format!("启动录音失败：{e}");
-                    continue;
-                }
-                app.phase = Phase::Recording(Instant::now());
-                app.status = "录音中…（松开结束）".into();
-            }
-            Action::Stop => {
-                let (rate, pcm) = live.capture.stop()?;
-                let secs = pcm.len() as f32 / rate as f32;
-                app.phase = Phase::Transcribing(Instant::now());
-                app.status = format!("转写中…（{secs:.1} 秒音频）");
-                let cfg = live.cfg.clone();
-                let hist = History::new(crate::config::history_path());
-                let tx = live.worker.0.clone();
-                live.busy = true;
-                std::thread::spawn(move || {
-                    let out = pipeline::prepare_wav(&cfg, &pcm, rate)
-                        .and_then(|wav| pipeline::transcribe_and_record(&cfg, &hist, &wav, secs))
-                        .map_err(|e| format!("{e:#}"));
-                    let _ = tx.send(out);
-                });
-            }
-            Action::Ignore => {}
+    // 带修饰键的按键一律不当作动作：Ctrl+D 是终端 EOF、Ctrl+C 是中断
+    let plain = k.modifiers.is_empty() || k.modifiers == KeyModifiers::SHIFT;
+    if k.modifiers.contains(KeyModifiers::CONTROL) {
+        match k.code {
+            KeyCode::Char('c') | KeyCode::Char('d') => return Ok(true),
+            _ => return Ok(false),
         }
     }
-
-    while let Ok(out) = live.worker.1.try_recv() {
-        live.busy = false;
-        app.phase = Phase::Idle;
-        match out {
-            Ok(text) => {
-                app.status = format!("完成：{}", text.chars().take(40).collect::<String>());
+    match k.code {
+        KeyCode::Esc => return Ok(true),
+        KeyCode::Up => app.selected = app.selected.saturating_sub(1),
+        KeyCode::Down => {
+            if app.selected + 1 < app.shown.len() {
+                app.selected += 1;
+            }
+        }
+        KeyCode::Char('q') if plain => return Ok(true),
+        KeyCode::Char('k') if plain => app.selected = app.selected.saturating_sub(1),
+        KeyCode::Char('j') if plain => {
+            if app.selected + 1 < app.shown.len() {
+                app.selected += 1;
+            }
+        }
+        KeyCode::Char('/') if plain => {
+            app.searching = true;
+            app.query.clear();
+            app.refilter();
+        }
+        KeyCode::Enter => {
+            if let Some(e) = app.current() {
+                let text = e.text.clone();
+                print!("{}", osc52(&text));
+                app.status = format!("已复制 {} 字", text.chars().count());
+            }
+        }
+        KeyCode::Char('d') if plain => {
+            if let Some(e) = app.current() {
+                let id = e.id.clone();
+                app.history.delete(&id)?;
                 app.reload();
+                app.status = "已删除一条".into();
             }
-            Err(e) => app.status = format!("失败：{e}"),
         }
+        KeyCode::Char('c') if plain => {
+            app.history.clear()?;
+            app.reload();
+            app.status = "已清空".into();
+        }
+        KeyCode::Char('r') if plain => {
+            app.reload();
+            app.status = "已刷新".into();
+        }
+        _ => {}
     }
-    Ok(())
+    Ok(false)
 }
 
 fn draw(f: &mut ratatui::Frame, app: &App) {
@@ -470,31 +453,35 @@ mod tests {
     use super::*;
 
     #[test]
-    fn hotkey_state_machine_ignores_duplicates() {
-        assert_eq!(on_hotkey(HotkeyEvent::Press, Phase::Idle), Action::Start);
-        // 已经录着时重复按：忽略（而不是重开一段）
-        assert_eq!(
-            on_hotkey(HotkeyEvent::Press, Phase::Recording(Instant::now())),
-            Action::Ignore
-        );
-        assert_eq!(
-            on_hotkey(HotkeyEvent::Release, Phase::Recording(Instant::now())),
-            Action::Stop
-        );
-        // 没在录就松开：忽略
-        assert_eq!(on_hotkey(HotkeyEvent::Release, Phase::Idle), Action::Ignore);
-        // 转写中再按：忽略，避免两段录音抢同一个转写
-        assert_eq!(
-            on_hotkey(HotkeyEvent::Press, Phase::Transcribing(Instant::now())),
-            Action::Ignore
-        );
-    }
-
-    #[test]
     fn osc52_encodes_text() {
         let s = osc52("你好");
         assert!(s.starts_with("\x1b]52;c;"));
         assert!(s.ends_with('\x07'));
         assert!(s.contains("5L2g5aW9"));
+    }
+
+    #[test]
+    fn status_file_maps_to_phases() {
+        // 直接构造状态文件，验证相位映射（attach 模式的核心）
+        let dir = std::env::temp_dir().join(format!("dictate-status-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("dictate")).unwrap();
+        std::env::set_var("XDG_DATA_HOME", &dir);
+        let path = dir.join("dictate/status.json");
+
+        std::fs::write(&path, r#"{"phase":"recording","since_ms":0}"#).unwrap();
+        let mut app = App::new(History::new(dir.join("history.jsonl")), Theme::dark());
+        apply_status(&mut app);
+        assert!(matches!(app.phase, Phase::Recording(_)));
+
+        std::fs::write(&path, r#"{"phase":"idle","since_ms":0,"text":"你好"}"#).unwrap();
+        apply_status(&mut app);
+        assert_eq!(app.phase, Phase::Idle);
+        assert!(app.status.contains("你好"));
+
+        std::fs::write(&path, r#"{"phase":"idle","since_ms":0,"error":"HTTP 401"}"#).unwrap();
+        apply_status(&mut app);
+        assert!(app.status.contains("401"));
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

@@ -60,6 +60,17 @@ fn run() -> Result<()> {
         "doctor" => cmd_doctor(),
         "history" => tui::run(History::new(config::history_path())),
         "run" => {
+            // 终端视图 + 托盘同时存在：热键/录音在守护进程里，这里只是附着
+            if !desktop::daemon_running() {
+                println!("启动守护进程（托盘）…");
+                desktop::spawn_daemon()?;
+                for _ in 0..40 {
+                    if desktop::daemon_running() {
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(75));
+                }
+            }
             let cfg = config::load()?;
             tui::run_live(cfg, History::new(config::history_path()))
         }

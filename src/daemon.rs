@@ -20,6 +20,7 @@ pub enum Phase {
 
 pub struct Daemon {
     cfg: Config,
+    published: String,
     capture: Capture,
     hk: Receiver<HotkeyEvent>,
     worker: (Sender<Result<String, String>>, Receiver<Result<String, String>>),
@@ -36,6 +37,7 @@ impl Daemon {
         let capture = crate::audio::spawn_capture()?;
         Ok(Self {
             cfg,
+            published: String::new(),
             capture,
             hk,
             worker: channel(),
@@ -43,6 +45,34 @@ impl Daemon {
             last_error: None,
             last_text: None,
         })
+    }
+
+    /// 把状态写进 `status.json`，供 `dictate run` 的终端视图读取。
+    fn publish(&mut self) {
+        let (phase, since) = match self.phase {
+            Phase::Idle => ("idle", 0),
+            Phase::Recording(t) => ("recording", now_ms(t)),
+            Phase::Transcribing(t) => ("transcribing", now_ms(t)),
+        };
+        let v = serde_json::json!({
+            "phase": phase,
+            "since_ms": since,
+            "text": self.last_text,
+            "error": self.last_error,
+        });
+        let body = v.to_string();
+        if body == self.published {
+            return;
+        }
+        let path = crate::config::status_path();
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir).ok();
+        }
+        let tmp = path.with_extension("json.tmp");
+        if std::fs::write(&tmp, &body).is_ok() {
+            std::fs::rename(&tmp, &path).ok();
+            self.published = body;
+        }
     }
 
     /// 处理一遍事件；返回托盘要显示的提示文字。
@@ -99,6 +129,7 @@ impl Daemon {
             }
         }
 
+        self.publish();
         match self.phase {
             Phase::Idle => match (&self.last_error, &self.last_text) {
                 (Some(e), _) => format!("dictate — 失败：{}", truncate(e, 60)),
@@ -113,6 +144,15 @@ impl Daemon {
             }
         }
     }
+}
+
+fn now_ms(t: Instant) -> u64 {
+    let elapsed = t.elapsed().as_millis() as u64;
+    (std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64)
+        .saturating_sub(elapsed)
 }
 
 fn truncate(s: &str, n: usize) -> String {
