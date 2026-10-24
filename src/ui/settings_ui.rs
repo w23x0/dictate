@@ -12,7 +12,7 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, List, ListItem, ListState, Paragraph};
+use ratatui::widgets::{Block, BorderType, Clear, List, ListItem, ListState, Paragraph};
 use ratatui::Terminal;
 
 use unicode_width::UnicodeWidthStr;
@@ -514,25 +514,33 @@ fn draw(fr: &mut ratatui::Frame, f: &Form) {
     let th = f.theme;
     use ratatui::layout::Rect;
 
-    // 选择器：独占整屏（比半透明浮层干净，终端里也没有"半透明"这回事）
+    // 选择器：居中圆角对话框，浮在设置列表上（opencode 的菜单样式）
     if let Some(p) = &f.picker {
-        let chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Length(1),
-                Constraint::Length(1),
-                Constraint::Min(3),
-                Constraint::Length(1),
-            ])
-            .split(fr.area());
-        fr.render_widget(
-            Paragraph::new(Line::from(vec![
-                Span::styled("◆ ", Style::default().fg(th.accent)),
-                Span::styled("dictate", Style::default().add_modifier(Modifier::BOLD)),
-                Span::styled(format!("  ·  {}", p.title), Style::default().fg(th.dim)),
-            ])),
-            chunks[0],
-        );
+        let area = fr.area();
+        let inner_w = p
+            .items
+            .iter()
+            .map(|(n, d)| UnicodeWidthStr::width(*n) + UnicodeWidthStr::width(*d) + 8)
+            .max()
+            .unwrap_or(24)
+            .max(28) as u16;
+        let w = (inner_w + 2).min(area.width.saturating_sub(2));
+        let h = p.items.len() as u16 + 2;
+        let rect = Rect {
+            x: area.x + area.width.saturating_sub(w) / 2,
+            y: area.y + area.height.saturating_sub(h) / 2,
+            width: w,
+            height: h,
+        };
+        // Clear 左边多清一格，避免底层宽字符吃掉对话框左边框（见 tui::clear_with_margin）
+        {
+            let x = rect.x.saturating_sub(1);
+            let width = rect
+                .width
+                .saturating_add(1)
+                .min(fr.area().width.saturating_sub(x));
+            fr.render_widget(Clear, Rect { x, width, ..rect });
+        }
         let rows: Vec<ListItem> = p
             .items
             .iter()
@@ -551,16 +559,35 @@ fn draw(fr: &mut ratatui::Frame, f: &Form) {
                     .bg(th.selected_bg)
                     .add_modifier(Modifier::BOLD),
             )
-            .highlight_symbol("❯");
-        fr.render_stateful_widget(list, chunks[2], &mut state);
-        fr.render_widget(
-            Paragraph::new(Line::from(Span::styled(
-                "↑↓ 选择   ⏎ 确认   Esc 取消",
-                Style::default().fg(th.faint),
-            )))
-            .alignment(ratatui::layout::Alignment::Right),
-            chunks[3],
-        );
+            .highlight_symbol("❯ ")
+            .block(
+                Block::default()
+                    .border_type(BorderType::Rounded)
+                    .borders(ratatui::widgets::Borders::ALL)
+                    .title(Span::styled(
+                        format!(" {} ", p.title),
+                        Style::default().fg(th.accent),
+                    ))
+                    .border_style(Style::default().fg(th.faint))
+                    .style(Style::default().bg(th.panel_bg)),
+            );
+        fr.render_stateful_widget(list, rect, &mut state);
+        let footer = Rect {
+            x: rect.x,
+            y: rect.y + h,
+            width: rect.width,
+            height: 1,
+        };
+        if footer.y < area.bottom() {
+            fr.render_widget(
+                Paragraph::new(Line::from(Span::styled(
+                    "↑↓ 选择   ⏎ 确认   Esc 取消",
+                    Style::default().fg(th.faint),
+                )))
+                .alignment(ratatui::layout::Alignment::Center),
+                footer,
+            );
+        }
         return;
     }
 

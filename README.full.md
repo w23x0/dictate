@@ -28,27 +28,27 @@ git clone https://github.com/w23x0/dictate && cd dictate && ./install.sh --local
 ## 日常使用
 
 ```bash
-dictate              # 托盘常驻（开机自启跑的就是这个）：热键说话，托盘菜单看历史/设置
+dictate              # 托盘常驻（开机自启跑的就是这个）：热键说话，托盘菜单手动录音/看历史/设置
 dictate history      # 终端里看历史（实时刷新，跟着守护进程走）
-dictate settings     # 改配置（模型、地址、key、热键、交付方式）
+dictate settings     # 改配置（模型、地址、key、热键、交付方式）——保存后托盘即时生效，不用重启
 ```
 
 第一次用必须先配置（没有 key 什么都转不出来）：
 
 ```bash
 dictate settings     # 模型/地址用列表选，key 直接填，改完自动保存
-dictate doctor       # 不录音，验 key / 区域 / 模型 / 粘贴能力
+dictate doctor       # 不录音，验 key / 区域 / 模型 / 粘贴能力 / 热键设备权限
 ```
 
 ## 交付方式（`paste`）
 
 | 值 | 行为 |
 |---|---|
-| `auto`（默认） | 存原剪贴板 → 写入文本 → 模拟粘贴键（`wtype`/`ydotool`/`xdotool` 里有哪个用哪个）→ 400 ms 后还原剪贴板 |
-| `clipboard` | 只写剪贴板，不按键 |
+| `auto`（默认） | 存原剪贴板 → 写入文本 → 模拟粘贴键（`wtype`/`ydotool`/`xdotool` 中有哪个用哪个）→ **粘贴成功后** 400 ms 还原剪贴板 |
+| `clipboard` | 只写剪贴板，不按键（文本会留在剪贴板里等你手动粘贴） |
 | `off` | 只进历史 |
 
-Wayland（GNOME）下没有 `wtype`/`ydotool` 时只能做到写剪贴板，程序会在状态里说明，按 `Ctrl+V` 即可。
+没粘上（比如 Wayland 下没有 `wtype`/`ydotool`）时同样保留新文本，状态里会说明，按 `Ctrl+V` 即可。
 `dictate doctor` 会列出当前机器上有哪些工具；`dictate inject-test "文字"` 可以单独验证这条链路。
 
 ## 热键
@@ -58,23 +58,34 @@ Wayland（GNOME）下没有 `wtype`/`ydotool` 时只能做到写剪贴板，程�
 | `hold`（默认） | 按住说话，松开提交；按一下就松（<200 ms）判为误触，直接丢弃 |
 | `toggle` | 按一下开始，再按一下停止 |
 
-默认 `ctrl+space`，改：`dictate settings` 或 `/hotkey alt+shift+d`。
+默认 `ctrl+space`，改：`dictate settings` 或 `/hotkey alt+shift+d`。改完即时生效——托盘进程盯着配置文件，热键监听线程每次按键都重读定义（Linux）；Windows 端钩子装的时候定死，要重启进程。
+
+托盘菜单里还有「录一段 / 停止录音」，没进 `input` 组、热键用不了时的兜底。
 
 - **Linux**：直读 `/dev/input/event*`（X11 / Wayland 通用），需要 `input` 组
 - **Windows**：`WH_KEYBOARD_LL` 低级钩子（未在真机验证，仅 `cargo check` 通过）
 
 ## 终端界面
 
-扁平布局，底部一行命令（和 grok-cli 一样，不背快捷键）：
+扁平布局，底部一行输入（和 grok-cli 一样，不背快捷键）：直接打字实时过滤历史；
+`/` 弹出 opencode 式命令面板——模糊过滤、命中字符高亮、`↑↓` 选、`⏎` 执行、`Tab` 补全。
 
 ```
-◆ dictate  v0.1.0  ctrl+space · qwen3-asr-flash          ● 就绪   12 条
+◆ dictate  v0.1.0  ctrl+space · qwen3-asr-flash                       ● 就绪   12 条
 
-▌ 22:37  ❯ 今天下午三点跟产品过一下这个需求，顺便把接口文档同步给后端。  1.8s
-  22:35  ❯ 帮我把这段代码里的 unwrap 全部换成 anyhow 的 context。        0.9s
+ 今天 ────────────────────────────────────────────────────────────
+▌ 22:37  ❯ 今天下午三点跟产品过一下这个需求，顺便把接口文档同步给后端， 4.2s → 0.9s
+           会议纪要发给所有相关同学。
+ 22:35  ❯ 帮我把这段代码里的 unwrap 全部换成 anyhow 的 context。   0.9s → 0.3s
+ 昨天 ────────────────────────────────────────────────────────────
+ 18:02  ❯ 长文本自动折行、按天分组；右边是 时长 → 转写耗时        2.1s → 0.7s
 
-❯ /                                   ← 真的输入框，光标停在这（输入法候选框跟着走）
-  /settings 打开设置   /model 切换模型   /record 手动录音   /help 帮助
+  ╭─ 命令 ──────────────────────────────────────╮
+  │ /settings  打开设置                         │
+  │ /search [文字]  按内容过滤历史               │
+  ╰─────────────────────────────────────────────╯
+❯ /set▏                          ← 输入法候选框跟着终端光标走
+  直接打字 = 实时过滤 · ⏎ 复制选中 · 空格录音 · F1 帮助
 ```
 
 | 命令 | 作用 |
@@ -87,7 +98,11 @@ Wayland（GNOME）下没有 `wtype`/`ydotool` 时只能做到写剪贴板，程�
 | `/clear` · `/daemon stop` | 清空历史 / 退守护进程（回车确认） |
 | `/help` · `/quit` | 帮助 / 退出视图 |
 
-键：`↑↓` 选择、`⏎` 输入为空时复制选中、`Del` 删除、`Esc` 清空输入/退出。
+键：`↑↓`/`j k` 选择 · `g` 最新 `G` 最旧 · `Ctrl+D/U` 翻半页 · `⏎` 复制选中（OSC 52）·
+`Del` 删除 · `空格` 手动录音 · `F1` 帮助 · `F2` 设置 · `F10`/`Esc`/`Ctrl+C` 退出视图 ·
+`Ctrl+R` 刷新 · `Ctrl+L` 清空历史 · `Ctrl+Q` 退守护进程。
+
+顶栏第二行常驻显示守护进程最近一次结果（完成/失败），命令反馈以 toast 形式显示几秒后消失。
 
 ## 支持的模型
 
@@ -122,7 +137,7 @@ src/
 ## 开发
 
 ```bash
-cargo test            # 52 条：AGC/VAD/重采样/WAV、三种报文形状真 socket 端到端、命令输入、历史 CRUD
+cargo test            # 65 条：AGC/VAD/重采样/WAV、三种报文形状真 socket 端到端、命令面板/折行/离屏渲染快照、历史 CRUD
 cargo clippy --all-targets
 cargo fmt
 ```
