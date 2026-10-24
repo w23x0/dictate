@@ -400,6 +400,23 @@ fn trunc(s: &str, width: usize) -> String {
     out
 }
 
+/// 最近失败的处理建议：错误不同，下一步该做的事也不同
+///（延续「服务端错误翻人话」的思路，把「怎么办」也带上）。
+fn error_hint(note: &str) -> &'static str {
+    let n = note.to_lowercase();
+    if n.contains("401") || n.contains("403") || n.contains("key") {
+        "/key 换个 key（或 F2 设置里改），改完说一句试试"
+    } else if n.contains("429") {
+        "限流了，等一会儿再试"
+    } else if n.contains("语音") || n.contains("门限") || n.contains("电平") {
+        "麦克风没信号：终端跑 dictate probe --seconds 3 看电平"
+    } else if n.contains("超时") || n.contains("timeout") {
+        "网络不通或太慢：/base 换个区域，或稍后再试"
+    } else {
+        "dictate doctor 可整链路体检"
+    }
+}
+
 /// 历史条目按天分组的小标题。
 fn day_label_at(ts: &str, today: chrono::NaiveDate, yesterday: chrono::NaiveDate) -> String {
     match chrono::DateTime::parse_from_rfc3339(ts) {
@@ -1058,13 +1075,28 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
         );
     } else if !app.daemon_note.is_empty() {
         let bad = app.daemon_note.starts_with("失败") || app.daemon_note.contains("没在跑");
-        f.render_widget(
-            Paragraph::new(Line::from(Span::styled(
-                trunc(&app.daemon_note, chunks[1].width.saturating_sub(2) as usize),
-                Style::default().fg(if bad { th.rec } else { th.dim }),
-            ))),
-            chunks[1],
-        );
+        if bad {
+            // 失败不只报红字：带上「下一步怎么办」
+            let hint = error_hint(&app.daemon_note);
+            let hint_w = UnicodeWidthStr::width(hint) + 5;
+            let budget = chunks[1].width.saturating_sub(hint_w as u16).max(10) as usize;
+            f.render_widget(
+                Paragraph::new(Line::from(vec![
+                    Span::styled(trunc(&app.daemon_note, budget), Style::default().fg(th.rec)),
+                    Span::styled("  →  ", Style::default().fg(th.faint)),
+                    Span::styled(hint, Style::default().fg(th.dim)),
+                ])),
+                chunks[1],
+            );
+        } else {
+            f.render_widget(
+                Paragraph::new(Line::from(Span::styled(
+                    trunc(&app.daemon_note, chunks[1].width.saturating_sub(2) as usize),
+                    Style::default().fg(th.dim),
+                ))),
+                chunks[1],
+            );
+        }
     }
 
     // ── 历史列表：按天分组 + 自动折行
@@ -1184,6 +1216,16 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
                 Style::default().fg(th.faint),
             ),
         ]
+    } else if let Some(secret) = app.input.strip_prefix("/key ") {
+        // key 不上屏：防止肩窥/截图泄露，只按字符数画圆点
+        vec![
+            Span::styled("❯ ", Style::default().fg(th.accent)),
+            Span::styled("/key ", Style::default().fg(Color::Reset)),
+            Span::styled(
+                "•".repeat(secret.chars().count()),
+                Style::default().fg(Color::Reset),
+            ),
+        ]
     } else {
         vec![
             Span::styled("❯ ", Style::default().fg(th.accent)),
@@ -1194,13 +1236,23 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
         Paragraph::new(Line::from(input_spans)).style(Style::default().bg(th.panel_bg)),
         inner,
     );
-    let w = unicode_width::UnicodeWidthStr::width(app.input.as_str()) as u16;
+    // 光标位置按「画出来的宽度」算：/key 打码后每个字符画成 1 格圆点
+    let w = if let Some(secret) = app.input.strip_prefix("/key ") {
+        5 + secret.chars().count() as u16
+    } else {
+        unicode_width::UnicodeWidthStr::width(app.input.as_str()) as u16
+    };
     f.set_cursor_position(((inner.x + 2 + w).min(inner.x + inner.width - 1), inner.y));
 
     // ── 第二行：命令/参数面板提示 > toast > 相位
     let hits = palette_hits(&app.input);
     let arg = arg_hits(&app.input);
-    let second: Line = if let Some((kind, ref h)) = arg {
+    let second: Line = if app.input.starts_with("/key ") {
+        Line::from(Span::styled(
+            "key 只写进本地配置（权限 600），输入行已打码   ⏎ 保存",
+            Style::default().fg(th.faint),
+        ))
+    } else if let Some((kind, ref h)) = arg {
         if h.is_empty() {
             Line::from(Span::styled(
                 if kind == ArgKind::Model {
@@ -1999,5 +2051,36 @@ mod tests {
         marked.marks.insert(first_id);
         let scr = render(&marked, "", 100, 28);
         assert!(scr.contains("✓"), "被标记的条目应有 ✓ 标记");
+    }
+
+    #[test]
+    fn key_input_is_masked_on_screen() {
+        let today = chrono::Local::now().date_naive();
+        let app = demo_app(today, "keymask");
+        let scr = render(&app, "/key sk-topsecret123", 100, 28);
+        assert!(!scr.contains("sk-topsecret123"), "key 明文绝不能上屏");
+        assert!(scr.contains("•••"), "key 应画成圆点");
+        let compact: String = scr.chars().filter(|c| !c.is_whitespace()).collect();
+        assert!(compact.contains("已打码"), "应说明输入行已打码");
+    }
+
+    #[test]
+    fn error_hints_point_to_the_next_step() {
+        assert!(error_hint("失败：HTTP 401 Unauthorized：key 不对").contains("/key"));
+        assert!(error_hint("失败：HTTP 429 Too Many Requests").contains("限流"));
+        assert!(error_hint("没有检测到语音：峰值 -90 dBFS，低于门限 -35 dBFS").contains("probe"));
+        assert!(error_hint("失败：请求超时").contains("/base"));
+        assert_eq!(error_hint("失败：别的什么"), "dictate doctor 可整链路体检");
+    }
+
+    #[test]
+    fn render_failure_note_with_hint() {
+        let today = chrono::Local::now().date_naive();
+        let mut app = demo_app(today, "errhint");
+        app.daemon_note = "失败：HTTP 401 Unauthorized：key 不对".into();
+        let scr = render(&app, "", 100, 28);
+        let compact: String = scr.chars().filter(|c| !c.is_whitespace()).collect();
+        assert!(compact.contains("401"), "错误本身要显示");
+        assert!(compact.contains("/key换个key"), "失败要带下一步建议");
     }
 }

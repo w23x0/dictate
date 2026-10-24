@@ -92,7 +92,7 @@ dictate doctor       # 不录音，验 key / 区域 / 模型 / 粘贴能力 / �
 |---|---|
 | `/settings` | 设置页（`Esc` 返回，改完自动保存） |
 | `/model` `/base` | 敲个空格后面板里选；直接带参数 = 原样设置 |
-| `/key sk-…` · `/hotkey ctrl+space` · `/mode hold\|toggle` | 改了立即写配置 |
+| `/key sk-…`（输入行自动打码）· `/hotkey ctrl+space` · `/mode hold\|toggle` | 改了立即写配置 |
 | `/record` | 手动开关录音 |
 | `/search 文字` | 过滤历史（直接打字也实时过滤） |
 | `/clear` · `/daemon stop` | 清空历史 / 退守护进程（回车确认） |
@@ -103,7 +103,8 @@ dictate doctor       # 不录音，验 key / 区域 / 模型 / 粘贴能力 / �
 `F1` 帮助 · `F2` 设置 · `F10`/`Esc`/`Ctrl+C` 退出视图 ·
 `Ctrl+R` 刷新 · `Ctrl+L` 清空历史 · `Ctrl+Q` 退守护进程。
 
-顶栏第二行常驻显示守护进程最近一次结果（完成/失败），命令反馈以 toast 形式显示几秒后消失。
+顶栏第二行常驻显示守护进程最近一次结果（完成/失败），命令反馈以 toast 形式显示几秒后消失；
+失败时红字后面直接跟「下一步怎么办」（换 key / 换区域 / 查麦克风电平 / 跑 doctor）。
 
 ## 支持的模型
 
@@ -138,7 +139,7 @@ src/
 ## 开发
 
 ```bash
-cargo test            # 69 条：AGC/VAD/重采样/WAV、三种报文形状真 socket 端到端、命令/参数面板、标记复制、离屏渲染快照、历史 CRUD
+cargo test            # 72 条：AGC/VAD/重采样/WAV、三种报文形状真 socket 端到端、命令/参数面板、标记复制、离屏渲染快照、历史 CRUD
 cargo clippy --all-targets
 cargo fmt
 ```
