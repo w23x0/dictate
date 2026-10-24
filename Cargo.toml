@@ -1,6 +1,6 @@
 [package]
 name = "dictate"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 description = "按住热键说话，文字进当前窗口（通义千问 ASR + 托盘）"
 license = "MIT"
