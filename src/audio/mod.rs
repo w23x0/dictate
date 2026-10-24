@@ -276,25 +276,39 @@ pub fn record_until(
     Ok((rate, data))
 }
 
+/// 在内存里生成 16 kHz 单声道 16 bit PCM WAV 字节（不落盘）。
+/// 头是 44 字节标准 RIFF/PCM，手写比让 hound 包一层 Cursor 干净（它拿不回 writer）；
+/// 正确性由测试用 hound 的 reader 读回来把关。
+pub fn wav_bytes(samples: &[f32]) -> Vec<u8> {
+    let data_len = (samples.len() * 2) as u32;
+    let mut v = Vec::with_capacity(44 + data_len as usize);
+    v.extend_from_slice(b"RIFF");
+    v.extend_from_slice(&(36 + data_len).to_le_bytes());
+    v.extend_from_slice(b"WAVE");
+    v.extend_from_slice(b"fmt ");
+    v.extend_from_slice(&16u32.to_le_bytes()); // fmt 段长度
+    v.extend_from_slice(&1u16.to_le_bytes()); // PCM
+    v.extend_from_slice(&1u16.to_le_bytes()); // 单声道
+    v.extend_from_slice(&TARGET_RATE.to_le_bytes());
+    v.extend_from_slice(&(TARGET_RATE * 2).to_le_bytes()); // 每秒字节数
+    v.extend_from_slice(&2u16.to_le_bytes()); // 块对齐
+    v.extend_from_slice(&16u16.to_le_bytes()); // 位深
+    v.extend_from_slice(b"data");
+    v.extend_from_slice(&data_len.to_le_bytes());
+    for s in samples {
+        let q = (s.clamp(-1.0, 1.0) * 32767.0).round() as i16;
+        v.extend_from_slice(&q.to_le_bytes());
+    }
+    v
+}
+
 /// 写 16 kHz 单声道 16 bit PCM WAV。
 pub fn write_wav(path: &std::path::Path, samples: &[f32]) -> Result<()> {
-    let spec = hound::WavSpec {
-        channels: 1,
-        sample_rate: TARGET_RATE,
-        bits_per_sample: 16,
-        sample_format: hound::SampleFormat::Int,
-    };
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir).ok();
     }
-    let mut w = hound::WavWriter::create(path, spec)
-        .with_context(|| format!("建 WAV 失败：{}", path.display()))?;
-    for s in samples {
-        let v = (s.clamp(-1.0, 1.0) * 32767.0).round() as i16;
-        w.write_sample(v)?;
-    }
-    w.finalize()?;
-    Ok(())
+    let bytes = wav_bytes(samples);
+    std::fs::write(path, bytes).with_context(|| format!("写 WAV 失败：{}", path.display()))
 }
 
 /// 读 WAV（只接受单声道或自动下混），返回（采样率，单声道 f32）。
@@ -488,6 +502,21 @@ mod tests {
         let p = dir.join("t.wav");
         let samples: Vec<f32> = (0..1600).map(|i| (i as f32 / 1600.0) * 0.5).collect();
         write_wav(&p, &samples).unwrap();
+        let (rate, back) = read_wav(&p).unwrap();
+        assert_eq!(rate, TARGET_RATE);
+        assert_eq!(back.len(), samples.len());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn wav_bytes_is_a_valid_wav() {
+        let samples: Vec<f32> = vec![0.0, 0.25, -0.25, 0.5];
+        let bytes = wav_bytes(&samples);
+        assert_eq!(&bytes[..4], b"RIFF");
+        let dir = std::env::temp_dir().join(format!("dictate-wavb-{}", std::process::id()));
+        let p = dir.join("t.wav");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(&p, &bytes).unwrap();
         let (rate, back) = read_wav(&p).unwrap();
         assert_eq!(rate, TARGET_RATE);
         assert_eq!(back.len(), samples.len());

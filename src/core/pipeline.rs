@@ -2,7 +2,7 @@
 //!
 //! 单独成模块是为了让 CLI（`transcribe` / `record`）和热键守护（TUI）共用同一份实现。
 
-use anyhow::{bail, Context, Result};
+use anyhow::{bail, Result};
 
 use crate::audio::agc::{Agc, AgcConfig};
 use crate::audio::{self, Downsampler};
@@ -51,12 +51,7 @@ pub fn prepare_wav(cfg: &Config, pcm: &[f32], rate: u32) -> Result<Vec<u8>> {
             .unwrap_or_else(|| std::env::temp_dir().join("last.wav"));
         audio::write_wav(&keep, &voiced).ok();
     }
-    let path = std::env::temp_dir().join(format!("dictate-{}.wav", new_id()));
-    audio::write_wav(&path, &voiced)?;
-    let bytes =
-        std::fs::read(&path).with_context(|| format!("读回临时 WAV 失败：{}", path.display()))?;
-    std::fs::remove_file(&path).ok();
-    Ok(bytes)
+    Ok(audio::wav_bytes(&voiced))
 }
 
 /// 不录音也能验通路：发一段 1 秒正弦，返回（耗时 ms，文本）。
@@ -66,10 +61,7 @@ pub fn self_test(cfg: &Config) -> Result<(u64, String)> {
             0.1 * (2.0 * std::f32::consts::PI * 440.0 * i as f32 / audio::TARGET_RATE as f32).sin()
         })
         .collect();
-    let path = std::env::temp_dir().join(format!("dictate-selftest-{}.wav", new_id()));
-    audio::write_wav(&path, &samples)?;
-    let wav = std::fs::read(&path)?;
-    std::fs::remove_file(&path).ok();
+    let wav = audio::wav_bytes(&samples);
     let client = crate::asr::QwenClient::from_config(cfg)?;
     let t = client.transcribe_wav(&wav)?;
     Ok((t.latency_ms, t.text))
