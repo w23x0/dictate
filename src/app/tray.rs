@@ -2,7 +2,7 @@
 
 use anyhow::Result;
 
-use crate::app::daemon::Daemon;
+use crate::app::daemon::{Daemon, Phase};
 use crate::core::config::Config;
 
 #[cfg(target_os = "linux")]
@@ -18,11 +18,12 @@ pub fn run(cfg: Config) -> Result<()> {
     let mut daemon = Daemon::new(cfg)?;
 
     let menu = Menu::new();
+    let record = MenuItem::with_id("record", "录一段", true, None);
     let history = MenuItem::with_id("history", "打开历史…", true, None);
     let settings = MenuItem::with_id("settings", "设置…", true, None);
     let sep = PredefinedMenuItem::separator();
     let quit = MenuItem::with_id("quit", "退出", true, None);
-    menu.append_items(&[&history, &settings, &sep, &quit])?;
+    menu.append_items(&[&record, &history, &settings, &sep, &quit])?;
 
     let icon = Icon::from_rgba(crate::ui::icon::rgba(), 64, 64)?;
     let tray = TrayIconBuilder::new()
@@ -32,9 +33,19 @@ pub fn run(cfg: Config) -> Result<()> {
         .with_icon(icon)
         .build()?;
 
+    let mut recording = false;
     glib::timeout_add_local(Duration::from_millis(100), move || {
         while let Ok(ev) = MenuEvent::receiver().try_recv() {
             match ev.id.0.as_str() {
+                "record" => {
+                    // 和终端视图同一条路：写控制文件，daemon.tick() 里执行
+                    let cmd = if matches!(daemon.phase, Phase::Recording(_)) {
+                        "stop"
+                    } else {
+                        "start"
+                    };
+                    let _ = std::fs::write(crate::core::config::control_path(), cmd);
+                }
                 "history" => {
                     let _ = crate::app::desktop::spawn_terminal("history");
                 }
@@ -50,6 +61,15 @@ pub fn run(cfg: Config) -> Result<()> {
         }
         let tip = daemon.tick();
         tray.set_tooltip(Some(&tip)).ok();
+        let now_recording = matches!(daemon.phase, Phase::Recording(_));
+        if now_recording != recording {
+            recording = now_recording;
+            record.set_text(if recording {
+                "停止录音"
+            } else {
+                "录一段"
+            });
+        }
         if daemon.quit {
             gtk::main_quit();
             return glib::ControlFlow::Break;
@@ -71,11 +91,12 @@ pub fn run(cfg: Config) -> Result<()> {
     let mut daemon = Daemon::new(cfg)?;
 
     let menu = Menu::new();
+    let record = MenuItem::with_id("record", "录一段", true, None);
     let history = MenuItem::with_id("history", "打开历史…", true, None);
     let settings = MenuItem::with_id("settings", "设置…", true, None);
     let sep = PredefinedMenuItem::separator();
     let quit = MenuItem::with_id("quit", "退出", true, None);
-    menu.append_items(&[&history, &settings, &sep, &quit])?;
+    menu.append_items(&[&record, &history, &settings, &sep, &quit])?;
 
     let icon = Icon::from_rgba(crate::ui::icon::rgba(), 64, 64)?;
     let tray = TrayIconBuilder::new()
@@ -86,9 +107,18 @@ pub fn run(cfg: Config) -> Result<()> {
         .build()?;
 
     // 简单消息泵：菜单事件由 muda 自己的线程投递，这里只轮询 + 睡。
+    let mut recording = false;
     loop {
         while let Ok(ev) = MenuEvent::receiver().try_recv() {
             match ev.id.0.as_str() {
+                "record" => {
+                    let cmd = if matches!(daemon.phase, Phase::Recording(_)) {
+                        "stop"
+                    } else {
+                        "start"
+                    };
+                    let _ = std::fs::write(crate::core::config::control_path(), cmd);
+                }
                 "history" => {
                     let _ = crate::app::desktop::spawn_terminal("history");
                 }
@@ -101,6 +131,15 @@ pub fn run(cfg: Config) -> Result<()> {
         }
         let tip = daemon.tick();
         tray.set_tooltip(Some(&tip)).ok();
+        let now_recording = matches!(daemon.phase, Phase::Recording(_));
+        if now_recording != recording {
+            recording = now_recording;
+            record.set_text(if recording {
+                "停止录音"
+            } else {
+                "录一段"
+            });
+        }
         if daemon.quit {
             return Ok(());
         }
