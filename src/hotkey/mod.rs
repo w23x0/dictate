@@ -88,8 +88,13 @@ impl Spec {
     }
 }
 
-/// 起监听线程；事件通过 `tx` 送出。返回的句柄被丢弃时线程仍继续（进程退出即结束）。
-pub fn spawn(spec: Spec, tx: Sender<HotkeyEvent>, verbose: bool) -> Result<()> {
+/// 所有监听线程共享的热键定义；运行中改写即可换键。
+/// Linux 的 evdev 线程每次按键都重读它；Windows 的钩子装的时候定死，改了要重启进程。
+pub type SharedSpec = std::sync::Arc<std::sync::RwLock<Spec>>;
+
+/// 起监听线程；事件通过 `tx` 送出。返回共享的热键定义，写它即可运行中换键。
+/// 句柄被丢弃时线程仍继续（进程退出即结束）。
+pub fn spawn(spec: Spec, tx: Sender<HotkeyEvent>, verbose: bool) -> Result<SharedSpec> {
     #[cfg(target_os = "linux")]
     {
         linux::spawn(spec, tx, verbose)
@@ -102,6 +107,18 @@ pub fn spawn(spec: Spec, tx: Sender<HotkeyEvent>, verbose: bool) -> Result<()> {
     {
         let _ = (spec, tx, verbose);
         bail!("这个平台还没有热键实现")
+    }
+}
+
+/// 诊断用：能读到几个带按键能力的输入设备；读不到（通常是没进 input 组）给原因。
+pub fn probe() -> Result<usize, String> {
+    #[cfg(target_os = "linux")]
+    {
+        linux::probe()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        Ok(0)
     }
 }
 

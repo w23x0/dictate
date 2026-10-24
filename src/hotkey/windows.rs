@@ -16,7 +16,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     WM_KEYDOWN, WM_KEYUP, WM_SYSKEYDOWN, WM_SYSKEYUP,
 };
 
-use super::{HotkeyEvent, Key, Spec};
+use super::{HotkeyEvent, Key, SharedSpec, Spec};
 
 static TX: OnceLock<Sender<HotkeyEvent>> = OnceLock::new();
 static SPEC: OnceLock<Spec> = OnceLock::new();
@@ -69,7 +69,7 @@ unsafe extern "system" fn hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -
     unsafe { CallNextHookEx(std::ptr::null_mut(), code, wparam, lparam) }
 }
 
-pub fn spawn(spec: Spec, tx: Sender<HotkeyEvent>) -> Result<()> {
+pub fn spawn(spec: Spec, tx: Sender<HotkeyEvent>) -> Result<SharedSpec> {
     SPEC.set(spec).ok();
     TX.set(tx).map_err(|_| anyhow!("热键监听已经启动过"))?;
     std::thread::spawn(|| unsafe {
@@ -81,5 +81,7 @@ pub fn spawn(spec: Spec, tx: Sender<HotkeyEvent>) -> Result<()> {
         let mut msg: MSG = std::mem::zeroed();
         while GetMessageW(&mut msg, std::ptr::null_mut(), 0, 0) > 0 {}
     });
-    Ok(())
+    // 钩子装的时候定死了：返回共享定义只是为了和 Linux 端签名一致，改它不生效，
+    // 换热键要重启进程。
+    Ok(std::sync::Arc::new(std::sync::RwLock::new(spec)))
 }

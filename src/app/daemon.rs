@@ -29,7 +29,10 @@ pub struct Daemon {
     published: String,
     capture: Capture,
     hk: Receiver<HotkeyEvent>,
+    hk_spec: hotkey::SharedSpec,
     worker: Worker,
+    /// 上次看到的配置文件 mtime；变了就热加载（模型/key/交付方式/热键都不用重启）。
+    cfg_mtime: Option<std::time::SystemTime>,
     pub phase: Phase,
     /// 本次录音的开始时刻（判断"误触"用）
     started: Option<Instant>,
@@ -44,14 +47,19 @@ impl Daemon {
     pub fn new(cfg: Config) -> Result<Self> {
         let spec = hotkey::Spec::parse(&cfg.hotkey)?;
         let (tx, hk) = channel();
-        hotkey::spawn(spec, tx, true)?;
+        let hk_spec = hotkey::spawn(spec, tx, true)?;
         let capture = crate::audio::spawn_capture(cfg.input_device.clone())?;
+        let cfg_mtime = std::fs::metadata(crate::core::config::config_path())
+            .and_then(|m| m.modified())
+            .ok();
         Ok(Self {
             cfg,
             published: String::new(),
             capture,
             hk,
+            hk_spec,
             worker: channel(),
+            cfg_mtime,
             phase: Phase::Idle,
             started: None,
             quit: false,
@@ -163,22 +171,42 @@ impl Daemon {
         }
     }
 
+    /// 配置文件变了就热加载：模型 / key / 交付方式即时生效，热键也直接换
+    ///（Linux 监听线程每次按键重读共享定义）。Windows 端热键仍需重启进程。
+    fn poll_config(&mut self) {
+        let mtime = std::fs::metadata(crate::core::config::config_path())
+            .and_then(|m| m.modified())
+            .ok();
+        if mtime == self.cfg_mtime {
+            return;
+        }
+        self.cfg_mtime = mtime;
+        match crate::core::config::load() {
+            Ok(cfg) => match hotkey::Spec::parse(&cfg.hotkey) {
+                Ok(spec) => {
+                    *self.hk_spec.write().unwrap_or_else(|e| e.into_inner()) = spec;
+                    self.cfg = cfg;
+                }
+                Err(e) => {
+                    // 热键没看懂就不动它，其余配置照常生效
+                    self.cfg = cfg;
+                    self.last_error = Some(format!("热键配置无效（{e}），沿用旧热键"));
+                }
+            },
+            Err(e) => self.last_error = Some(format!("重读配置失败：{e}")),
+        }
+    }
+
     /// 处理一遍事件；返回托盘要显示的提示文字。
     pub fn tick(&mut self) -> String {
         self.poll_control();
+        self.poll_config();
         while let Ok(ev) = self.hk.try_recv() {
             let toggle = self.cfg.hotkey_mode.eq_ignore_ascii_case("toggle");
             match (ev, self.phase) {
                 (HotkeyEvent::Press, Phase::Recording(_)) if toggle => self.stop(),
                 (HotkeyEvent::Release, _) if toggle => {}
-                (HotkeyEvent::Press, Phase::Idle) => {
-                    // 每次开录前重读配置：这样 `dictate settings` 保存后不用重启托盘进程
-                    //（热键本身除外，它在启动时就绑定了）。
-                    if let Ok(cfg) = crate::core::config::load() {
-                        self.cfg = cfg;
-                    }
-                    self.start();
-                }
+                (HotkeyEvent::Press, Phase::Idle) => self.start(),
                 (HotkeyEvent::Release, Phase::Recording(_)) => self.stop(),
                 _ => {}
             }

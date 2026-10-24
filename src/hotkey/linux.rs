@@ -10,7 +10,7 @@ use std::sync::Arc;
 use anyhow::{anyhow, Result};
 use evdev::{Device, EventType};
 
-use super::{HotkeyEvent, Key, Spec};
+use super::{HotkeyEvent, Key, SharedSpec, Spec};
 
 // Linux 输入子系统的键码是稳定 ABI，直接写数字比跟着 crate 的常量走更不容易漂。
 const KEY_ESC: u16 = 1;
@@ -74,12 +74,13 @@ impl Mods {
     }
 }
 
-pub fn spawn(spec: Spec, tx: Sender<HotkeyEvent>, verbose: bool) -> Result<()> {
+pub fn spawn(spec: Spec, tx: Sender<HotkeyEvent>, verbose: bool) -> Result<SharedSpec> {
     let paths = device_paths();
     if paths.is_empty() {
         return Err(anyhow!("找不到 /dev/input/event*"));
     }
     let tx = Arc::new(tx);
+    let shared: SharedSpec = Arc::new(std::sync::RwLock::new(spec));
     let mut opened = 0usize;
     let mut last_err: Option<String> = None;
 
@@ -102,6 +103,7 @@ pub fn spawn(spec: Spec, tx: Sender<HotkeyEvent>, verbose: bool) -> Result<()> {
             eprintln!("[hotkey] 监听 {name}（{}）", path.display());
         }
         let tx = Arc::clone(&tx);
+        let spec = Arc::clone(&shared);
         std::thread::spawn(move || watch(dev, spec, tx));
     }
 
@@ -112,7 +114,32 @@ pub fn spawn(spec: Spec, tx: Sender<HotkeyEvent>, verbose: bool) -> Result<()> {
              sudo usermod -aG input $USER"
         ));
     }
-    Ok(())
+    Ok(shared)
+}
+
+/// 诊断用：能读到几个带按键能力的设备（`dictate doctor` 调用）。
+pub fn probe() -> Result<usize, String> {
+    let paths = device_paths();
+    if paths.is_empty() {
+        return Err("找不到 /dev/input/event*".into());
+    }
+    let mut readable = 0usize;
+    let mut last_err = None;
+    for path in paths {
+        match Device::open(&path) {
+            Ok(d) => {
+                if d.supported_keys().is_some() {
+                    readable += 1;
+                }
+            }
+            Err(e) => last_err = Some(format!("{}：{e}", path.display())),
+        }
+    }
+    if readable == 0 {
+        Err(last_err.unwrap_or_else(|| "没有带按键的设备".into()))
+    } else {
+        Ok(readable)
+    }
 }
 
 fn device_paths() -> Vec<std::path::PathBuf> {
@@ -133,8 +160,7 @@ fn device_paths() -> Vec<std::path::PathBuf> {
     v
 }
 
-fn watch(mut dev: Device, spec: Spec, tx: Arc<Sender<HotkeyEvent>>) {
-    let target = code_for(spec.key);
+fn watch(mut dev: Device, spec: SharedSpec, tx: Arc<Sender<HotkeyEvent>>) {
     let mut mods = Mods::default();
     let mut down = false;
     loop {
@@ -153,8 +179,10 @@ fn watch(mut dev: Device, spec: Spec, tx: Arc<Sender<HotkeyEvent>>) {
             }
             let pressed = value == 1;
             mods.update(code, pressed);
-            if code == target {
-                if pressed && !down && mods.matches(&spec) {
+            // 每次按键都重读共享定义：`dictate settings` 改了热键立即生效，不用重启。
+            let cur = *spec.read().unwrap_or_else(|e| e.into_inner());
+            if code == code_for(cur.key) {
+                if pressed && !down && mods.matches(&cur) {
                     down = true;
                     let _ = tx.send(HotkeyEvent::Press);
                 } else if !pressed && down {

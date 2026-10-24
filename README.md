@@ -20,7 +20,7 @@ curl -fsSL https://raw.githubusercontent.com/w23x0/dictate/main/install.sh | bas
 ```bash
 dictate            # 托盘常驻：热键可用，菜单里看历史/设置
 dictate settings   # 模型、服务地址、key、热键、交付方式（改完自动保存）
-dictate doctor     # 不录音，验 key / 区域 / 模型 / 粘贴能力
+dictate doctor     # 不录音，验 key / 区域 / 模型 / 粘贴能力 / 热键设备
 dictate history    # 终端里看历史（实时）
 ```
 

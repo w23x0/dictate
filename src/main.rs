@@ -156,6 +156,16 @@ fn cmd_doctor() -> Result<()> {
         println!("报文形状：{}", style.name());
     }
     println!("交付能力：{}", inject::capabilities());
+    #[cfg(target_os = "linux")]
+    {
+        print!("热键设备：");
+        match hotkey::probe() {
+            Ok(n) => println!("{n} 个键盘设备可读"),
+            Err(e) => {
+                println!("读不到（{e}）。加 input 组后重新登录：sudo usermod -aG input $USER")
+            }
+        }
+    }
     println!(
         "区域 key：{}",
         match cfg.api_key() {
