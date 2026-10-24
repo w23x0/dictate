@@ -30,8 +30,8 @@ fn pad(s: &str, width: usize) -> String {
     }
 }
 
-/// 支持的模型（只列真的能用这三种报文形状跑的）。
-const MODELS: &[(&str, &str)] = &[
+/// 支持的模型（只列真的能用这三种报文形状跑的）。tui 的 /model 参数面板共用。
+pub(crate) const MODELS: &[(&str, &str)] = &[
     (
         "qwen3-asr-flash",
         "OpenAI 兼容 · 10 MB / 5 分钟 · 支持 ITN、语言指定",
@@ -46,7 +46,7 @@ const MODELS: &[(&str, &str)] = &[
     ("qwen3-asr-flash-realtime", "WebSocket 实时"),
 ];
 
-const BASES: &[(&str, &str)] = &[
+pub(crate) const BASES: &[(&str, &str)] = &[
     ("https://dashscope.aliyuncs.com", "中国（北京）"),
     ("https://dashscope-intl.aliyuncs.com", "新加坡"),
 ];

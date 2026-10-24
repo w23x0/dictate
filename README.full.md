@@ -91,15 +91,16 @@ dictate doctor       # 不录音，验 key / 区域 / 模型 / 粘贴能力 / �
 | 命令 | 作用 |
 |---|---|
 | `/settings` | 设置页（`Esc` 返回，改完自动保存） |
-| `/model` `/base` | 不带参数 = 列表选；带参数 = 直接设 |
+| `/model` `/base` | 敲个空格后面板里选；直接带参数 = 原样设置 |
 | `/key sk-…` · `/hotkey ctrl+space` · `/mode hold\|toggle` | 改了立即写配置 |
 | `/record` | 手动开关录音 |
 | `/search 文字` | 过滤历史（直接打字也实时过滤） |
 | `/clear` · `/daemon stop` | 清空历史 / 退守护进程（回车确认） |
 | `/help` · `/quit` | 帮助 / 退出视图 |
 
-键：`↑↓`/`j k` 选择 · `g` 最新 `G` 最旧 · `Ctrl+D/U` 翻半页 · `⏎` 复制选中（OSC 52）·
-`Del` 删除 · `空格` 手动录音 · `F1` 帮助 · `F2` 设置 · `F10`/`Esc`/`Ctrl+C` 退出视图 ·
+键：`↑↓`/`j k` 选择 · `g` 最新 `G` 最旧 · `Ctrl+D/U` 翻半页 · `m` 标记多条 ·
+`⏎` 复制选中（有标记则整批复制，OSC 52）· `Del` 删除 · `空格` 手动录音 ·
+`F1` 帮助 · `F2` 设置 · `F10`/`Esc`/`Ctrl+C` 退出视图 ·
 `Ctrl+R` 刷新 · `Ctrl+L` 清空历史 · `Ctrl+Q` 退守护进程。
 
 顶栏第二行常驻显示守护进程最近一次结果（完成/失败），命令反馈以 toast 形式显示几秒后消失。
@@ -137,7 +138,7 @@ src/
 ## 开发
 
 ```bash
-cargo test            # 65 条：AGC/VAD/重采样/WAV、三种报文形状真 socket 端到端、命令面板/折行/离屏渲染快照、历史 CRUD
+cargo test            # 69 条：AGC/VAD/重采样/WAV、三种报文形状真 socket 端到端、命令/参数面板、标记复制、离屏渲染快照、历史 CRUD
 cargo clippy --all-targets
 cargo fmt
 ```

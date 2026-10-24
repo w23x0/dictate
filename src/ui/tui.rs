@@ -66,6 +66,8 @@ struct App {
     input: String,
     /// 命令面板里选中的条目
     palette_sel: usize,
+    /// 标记的历史条目 id（`m` 切换；⏎ 时一起复制）
+    marks: std::collections::HashSet<String>,
     toast: Option<Toast>,
     quit_requested: bool,
 }
@@ -112,6 +114,7 @@ impl App {
             settings: None,
             input: String::new(),
             palette_sel: 0,
+            marks: std::collections::HashSet::new(),
             toast: None,
             quit_requested: false,
         };
@@ -234,6 +237,91 @@ fn palette_hits(input: &str) -> Vec<(usize, Vec<usize>)> {
 fn cmd_hint(line: &str) -> Option<(&'static str, &'static str, &'static str)> {
     let first = line.split(' ').next().unwrap_or("");
     COMMANDS.iter().find(|(n, _, _)| *n == first).copied()
+}
+
+// ───────────────────── /model、/base 的参数面板 ─────────────────────
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ArgKind {
+    Model,
+    Base,
+}
+
+impl ArgKind {
+    fn items(self) -> &'static [(&'static str, &'static str)] {
+        match self {
+            ArgKind::Model => crate::ui::settings_ui::MODELS,
+            ArgKind::Base => crate::ui::settings_ui::BASES,
+        }
+    }
+    fn title(self) -> &'static str {
+        match self {
+            ArgKind::Model => " 模型 ",
+            ArgKind::Base => " 服务地址 ",
+        }
+    }
+    fn cmd(self) -> &'static str {
+        match self {
+            ArgKind::Model => "/model",
+            ArgKind::Base => "/base",
+        }
+    }
+}
+
+/// `/model `、`/base ` 敲了空格后弹参数列表（不用再进设置页挑）。
+/// 过滤是名字上的不区分大小写子串；返回命中下标（保持声明顺序）。
+fn arg_hits(input: &str) -> Option<(ArgKind, Vec<usize>)> {
+    let (kind, rest) = if let Some(r) = input.strip_prefix("/model ") {
+        (ArgKind::Model, r)
+    } else {
+        let r = input.strip_prefix("/base ")?;
+        (ArgKind::Base, r)
+    };
+    let q = rest.trim().to_lowercase();
+    let hits: Vec<usize> = kind
+        .items()
+        .iter()
+        .enumerate()
+        .filter(|(_, (n, _))| q.is_empty() || n.to_lowercase().contains(&q))
+        .map(|(i, _)| i)
+        .collect();
+    Some((kind, hits))
+}
+
+/// 参数面板里选定一项：写配置 + toast。
+fn apply_arg(app: &mut App, kind: ArgKind, name: &str) {
+    let Ok(mut cfg) = crate::core::config::load() else {
+        toast_err(app, "读配置失败");
+        return;
+    };
+    match kind {
+        ArgKind::Model => {
+            if crate::asr::pick_style(name, None).is_err() {
+                toast_err(app, format!("{name} 不支持（异步 filetrans 没做）"));
+                return;
+            }
+            cfg.model = name.to_string();
+            cfg.api_style = None;
+            if let Err(e) = crate::core::config::write(&crate::core::config::config_path(), &cfg) {
+                toast_err(app, format!("保存失败：{e}"));
+                return;
+            }
+            toast(app, format!("模型 → {name}（下次录音生效）"));
+        }
+        ArgKind::Base => match crate::asr::normalize_base(name) {
+            Ok(b) => {
+                cfg.base_url = b;
+                if let Err(e) =
+                    crate::core::config::write(&crate::core::config::config_path(), &cfg)
+                {
+                    toast_err(app, format!("保存失败：{e}"));
+                    return;
+                }
+                toast(app, format!("服务地址 → {}", cfg.base_url));
+            }
+            Err(e) => toast_err(app, format!("地址不合法：{e}")),
+        },
+    }
 }
 
 // ───────────────────────── 文本加工 ─────────────────────────
@@ -534,6 +622,7 @@ fn handle_key(app: &mut App, k: &crossterm::event::KeyEvent) -> Result<Outcome> 
                 KeyCode::Enter => {
                     app.history.clear()?;
                     app.reload();
+                    app.marks.clear();
                     toast(app, "已清空");
                     app.overlay = None;
                 }
@@ -557,6 +646,15 @@ fn handle_key(app: &mut App, k: &crossterm::event::KeyEvent) -> Result<Outcome> 
     let hits = palette_hits(&app.input);
     let palette = palette_query(&app.input).is_some() && !hits.is_empty();
     let sel = app.palette_sel.min(hits.len().saturating_sub(1));
+    // /model、/base 的参数面板（有命中才算激活）
+    let arg = arg_hits(&app.input);
+    let arg_active = matches!(&arg, Some((_, h)) if !h.is_empty());
+    let arg_sel = app.palette_sel.min(
+        arg.as_ref()
+            .map(|(_, h)| h.len())
+            .unwrap_or(1)
+            .saturating_sub(1),
+    );
 
     // Ctrl 系列与功能键
     match k.code {
@@ -612,7 +710,12 @@ fn handle_key(app: &mut App, k: &crossterm::event::KeyEvent) -> Result<Outcome> 
             app.refilter();
         }
         KeyCode::Enter => {
-            if palette {
+            if arg_active {
+                let (kind, h) = arg.unwrap();
+                let name = kind.items()[h[arg_sel]].0.to_string();
+                apply_arg(app, kind, &name);
+                app.input.clear();
+            } else if palette {
                 // 面板里回车：无参命令直接执行，带参命令把名字填进去继续敲参数
                 let (ci, _) = hits[sel];
                 let (name, arg, _) = COMMANDS[ci];
@@ -644,14 +747,19 @@ fn handle_key(app: &mut App, k: &crossterm::event::KeyEvent) -> Result<Outcome> 
             app.refilter();
         }
         KeyCode::Up => {
-            if palette {
+            if arg_active {
+                app.palette_sel = arg_sel.saturating_sub(1);
+            } else if palette {
                 app.palette_sel = sel.saturating_sub(1);
             } else {
                 app.selected = app.selected.saturating_sub(1);
             }
         }
         KeyCode::Down => {
-            if palette {
+            if arg_active {
+                let n = arg.as_ref().unwrap().1.len();
+                app.palette_sel = (arg_sel + 1).min(n - 1);
+            } else if palette {
                 app.palette_sel = (sel + 1).min(hits.len() - 1);
             } else if app.selected + 1 < app.shown.len() {
                 app.selected += 1;
@@ -664,6 +772,11 @@ fn handle_key(app: &mut App, k: &crossterm::event::KeyEvent) -> Result<Outcome> 
         // 列表是倒序的：Home/g = 最新，End/G = 最旧
         KeyCode::Home => app.selected = 0,
         KeyCode::End => app.selected = app.shown.len().saturating_sub(1),
+        KeyCode::Tab if arg_active => {
+            let (kind, h) = arg.as_ref().unwrap();
+            let name = kind.items()[h[arg_sel]].0;
+            app.input = format!("{} {name}", kind.cmd());
+        }
         KeyCode::Tab if palette => {
             let (ci, _) = hits[sel];
             let (name, arg, _) = COMMANDS[ci];
@@ -683,6 +796,14 @@ fn handle_key(app: &mut App, k: &crossterm::event::KeyEvent) -> Result<Outcome> 
         }
         // 输入为空时这些键是导航/操作，不进输入框（想按文字过滤就用别的字符起头）
         KeyCode::Char(' ') if app.input.is_empty() => toggle_record(app),
+        KeyCode::Char('m') if app.input.is_empty() => {
+            if let Some(e) = app.current() {
+                let id = e.id.clone();
+                if !app.marks.remove(&id) {
+                    app.marks.insert(id);
+                }
+            }
+        }
         KeyCode::Char('j') if app.input.is_empty() => {
             if app.selected + 1 < app.shown.len() {
                 app.selected += 1;
@@ -713,6 +834,27 @@ fn handle_key(app: &mut App, k: &crossterm::event::KeyEvent) -> Result<Outcome> 
 fn run_input(app: &mut App) -> Result<()> {
     let line = app.input.trim().to_string();
     if line.is_empty() {
+        // 有标记就整批复制（⏎ = 把标记的条目拼起来送 OSC 52）
+        let marked: Vec<String> = app
+            .shown
+            .iter()
+            .map(|i| &app.all[*i])
+            .filter(|e| app.marks.contains(&e.id))
+            .map(|e| e.text.clone())
+            .collect();
+        if !marked.is_empty() {
+            let joined = marked.join("\n");
+            print!("{}", osc52(&joined));
+            toast(
+                app,
+                format!(
+                    "已复制 {} 条（共 {} 字）",
+                    marked.len(),
+                    joined.chars().count()
+                ),
+            );
+            return Ok(());
+        }
         // 空输入按回车 = 复制选中记录（grok 里是"发送"，这里没有消息可发）
         if let Some(e) = app.current() {
             let text = e.text.clone();
@@ -960,6 +1102,7 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
             first_item_of.push(items.len());
 
             let is_selected = pos == app.selected;
+            let is_marked = app.marks.contains(&e.id);
             let time = e.ts.get(11..16).unwrap_or("--:--");
             let (body, color) = if e.is_ok() {
                 (e.text.replace('\n', " "), Color::Reset)
@@ -975,7 +1118,14 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
                 let mut spans: Vec<Span> = Vec::new();
                 if li == 0 {
                     spans.push(Span::styled(
-                        if is_selected { "▌" } else { " " }.to_string(),
+                        if is_marked {
+                            "✓"
+                        } else if is_selected {
+                            "▌"
+                        } else {
+                            " "
+                        }
+                        .to_string(),
                         Style::default().fg(th.accent),
                     ));
                     spans.push(Span::styled(
@@ -1030,7 +1180,7 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
         vec![
             Span::styled("❯ ", Style::default().fg(th.accent)),
             Span::styled(
-                "输入过滤历史 · / 命令 · ⏎ 复制选中",
+                "输入过滤历史 · / 命令 · m 标记 · ⏎ 复制",
                 Style::default().fg(th.faint),
             ),
         ]
@@ -1047,9 +1197,26 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
     let w = unicode_width::UnicodeWidthStr::width(app.input.as_str()) as u16;
     f.set_cursor_position(((inner.x + 2 + w).min(inner.x + inner.width - 1), inner.y));
 
-    // ── 第二行：命令提示 > toast > 相位
+    // ── 第二行：命令/参数面板提示 > toast > 相位
     let hits = palette_hits(&app.input);
-    let second: Line = if app.input.starts_with('/') {
+    let arg = arg_hits(&app.input);
+    let second: Line = if let Some((kind, ref h)) = arg {
+        if h.is_empty() {
+            Line::from(Span::styled(
+                if kind == ArgKind::Model {
+                    "没有匹配的模型（回车按原样执行）"
+                } else {
+                    "没有匹配的地址（回车按原样执行）"
+                },
+                Style::default().fg(th.faint),
+            ))
+        } else {
+            Line::from(Span::styled(
+                format!("{}  ↑↓ 选择  ⏎ 使用  Tab 补名", kind.title().trim()),
+                Style::default().fg(th.faint),
+            ))
+        }
+    } else if app.input.starts_with('/') {
         if let Some(&(ci, _)) = hits.first() {
             // 面板打开着：提示怎么操作
             let (_, _, desc) = COMMANDS[ci];
@@ -1093,8 +1260,42 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
         },
     );
 
-    // ── 命令面板（浮在输入框上方，opencode 的命令菜单样式）
-    if palette_query(&app.input).is_some() && !hits.is_empty() {
+    // ── 浮动面板（命令 / 参数），opencode 的菜单样式：浮在输入框上方
+    if let Some((kind, h)) = &arg {
+        if !h.is_empty() {
+            let sel = app.palette_sel.min(h.len() - 1);
+            let items = kind.items();
+            let rows: Vec<Line> = h
+                .iter()
+                .take(8)
+                .enumerate()
+                .map(|(row, &i)| {
+                    let (name, desc) = items[i];
+                    let mut line = Line::from(vec![
+                        Span::styled(format!(" {name}  "), Style::default().fg(th.accent)),
+                        Span::styled(desc.to_string(), Style::default().fg(th.dim)),
+                    ]);
+                    if row == sel {
+                        line = line.style(Style::default().bg(th.selected_bg));
+                    }
+                    line
+                })
+                .collect();
+            let n = rows.len() as u16;
+            render_float_box(
+                f,
+                th,
+                Rect {
+                    x: area.x + 2,
+                    y: panel.y.saturating_sub(n + 3),
+                    width: 64.min(area.width.saturating_sub(4)),
+                    height: n + 2,
+                },
+                kind.title(),
+                rows,
+            );
+        }
+    } else if palette_query(&app.input).is_some() && !hits.is_empty() {
         let sel = app.palette_sel.min(hits.len() - 1);
         let n = hits.len().min(8) as u16;
         let w = 64.min(area.width.saturating_sub(4));
@@ -1104,7 +1305,6 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
             width: w,
             height: n + 2,
         };
-        clear_with_margin(f, rect);
         let rows: Vec<Line> = hits
             .iter()
             .take(8)
@@ -1140,17 +1340,7 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
                 line
             })
             .collect();
-        f.render_widget(
-            Paragraph::new(rows).block(
-                Block::default()
-                    .border_type(BorderType::Rounded)
-                    .borders(ratatui::widgets::Borders::ALL)
-                    .title(Span::styled(" 命令 ", Style::default().fg(th.accent)))
-                    .border_style(Style::default().fg(th.faint))
-                    .style(Style::default().bg(th.panel_bg)),
-            ),
-            rect,
-        );
+        render_float_box(f, th, rect, " 命令 ", rows);
     }
 
     if let Some(ov) = app.overlay {
@@ -1158,10 +1348,26 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
     }
 }
 
+/// 居中样式的浮动小面板（圆角 + 标题 + 清底）。
+fn render_float_box(f: &mut ratatui::Frame, th: Theme, rect: Rect, title: &str, rows: Vec<Line>) {
+    clear_with_margin(f, rect);
+    f.render_widget(
+        Paragraph::new(rows).block(
+            Block::default()
+                .border_type(BorderType::Rounded)
+                .borders(ratatui::widgets::Borders::ALL)
+                .title(Span::styled(title, Style::default().fg(th.accent)))
+                .border_style(Style::default().fg(th.faint))
+                .style(Style::default().bg(th.panel_bg)),
+        ),
+        rect,
+    );
+}
+
 fn hint_line(app: &App, th: Theme) -> Line<'static> {
     let _ = app;
     Line::from(Span::styled(
-        "↑↓/jk 选择 · 空格录音 · / 命令 · ⏎ 复制 · Del 删除 · F1 帮助",
+        "↑↓/jk 选择 · m 标记 · 空格录音 · / 命令 · ⏎ 复制 · Del 删除 · F1 帮助",
         Style::default().fg(th.faint),
     ))
 }
@@ -1207,8 +1413,10 @@ fn draw_overlay(f: &mut ratatui::Frame, app: &App, ov: Overlay) {
                 Line::from("录音    空格 或 /record 手动开始 / 停止"),
                 Line::from(""),
                 Line::from("记录    ⏎ 复制选中（OSC 52）   Del 删除"),
+                Line::from("        m 标记多条，⏎ 一起复制"),
                 Line::from(""),
                 Line::from("命令    / 打开命令面板：↑↓ 选、⏎ 执行、Tab 补全"),
+                Line::from("        /model 或 /base 敲个空格 = 直接列表选"),
                 Line::from("        直接打字 = 实时过滤历史（Esc 清除）"),
                 Line::from(""),
                 Line::from("其它    F2 设置   Ctrl+R 刷新   Ctrl+L 清空历史"),
@@ -1335,6 +1543,69 @@ mod tests {
     fn cmd_hint_matches_first_token() {
         assert_eq!(cmd_hint("/model qwen3-asr-flash").unwrap().0, "/model");
         assert!(cmd_hint("/nope x").is_none());
+    }
+
+    #[test]
+    fn arg_palette_filters_models_and_bases() {
+        use crate::ui::settings_ui::{BASES, MODELS};
+        // 敲了空格才算参数面板
+        assert!(arg_hits("/model").is_none());
+        let (kind, h) = arg_hits("/model ").unwrap();
+        assert_eq!(kind, ArgKind::Model);
+        assert_eq!(h.len(), MODELS.len());
+        let (_, h) = arg_hits("/model qwen3").unwrap();
+        let names: Vec<_> = h.iter().map(|&i| MODELS[i].0).collect();
+        assert!(names.contains(&"qwen3-asr-flash"), "{names:?}");
+        assert!(names.contains(&"qwen3-asr-flash-realtime"), "{names:?}");
+        assert!(arg_hits("/model nope-xyz").unwrap().1.is_empty());
+        let (kind, h) = arg_hits("/base 新").unwrap(); // 地址里没有中文
+        assert_eq!(kind, ArgKind::Base);
+        assert!(h.is_empty());
+        let (_, h) = arg_hits("/base ").unwrap();
+        assert_eq!(h.len(), BASES.len());
+    }
+
+    #[test]
+    fn arg_palette_navigates_and_tabs() {
+        use crate::ui::settings_ui::MODELS;
+        let dir = std::env::temp_dir().join(format!("dictate-argpal-{}", std::process::id()));
+        let mut app = app_with_entries(dir.to_str().unwrap());
+        let kc = |c: KeyCode| crossterm::event::KeyEvent::new(c, KeyModifiers::NONE);
+        for c in "/model ".chars() {
+            handle_key(&mut app, &key(c)).unwrap();
+        }
+        handle_key(&mut app, &kc(KeyCode::Down)).unwrap();
+        handle_key(&mut app, &kc(KeyCode::Down)).unwrap();
+        // Tab 把面板里选中的名字补进输入行
+        handle_key(&mut app, &kc(KeyCode::Tab)).unwrap();
+        assert_eq!(app.input, format!("/model {}", MODELS[2].0));
+        // 补全后名字本身就是过滤器：Up/Tab 停在这一项上（回车即用）
+        handle_key(&mut app, &kc(KeyCode::Up)).unwrap();
+        handle_key(&mut app, &kc(KeyCode::Tab)).unwrap();
+        assert_eq!(app.input, format!("/model {}", MODELS[2].0));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn mark_entries_and_batch_copy() {
+        let dir = std::env::temp_dir().join(format!("dictate-marks-{}", std::process::id()));
+        let mut app = app_with_entries(dir.to_str().unwrap());
+        // m 标记当前（new）→ j 下移 → m 标记（mid）
+        handle_key(&mut app, &key('m')).unwrap();
+        handle_key(&mut app, &key('j')).unwrap();
+        handle_key(&mut app, &key('m')).unwrap();
+        assert_eq!(app.marks.len(), 2);
+        assert!(app.marks.contains("new") && app.marks.contains("mid"));
+        // 空输入 ⏎ = 整批复制（toast 报条数；OSC 52 走 stdout，不在这里验）
+        let enter = crossterm::event::KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        handle_key(&mut app, &enter).unwrap();
+        let t = app.toast.as_ref().expect("应有复制 toast");
+        assert!(t.msg.contains("2 条"), "toast={}", t.msg);
+        // 输入非空时 m 是普通字符
+        handle_key(&mut app, &key('x')).unwrap();
+        handle_key(&mut app, &key('m')).unwrap();
+        assert_eq!(app.input, "xm");
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     // ── 折行 / 截断 / 日期 ──
@@ -1581,6 +1852,7 @@ mod tests {
             settings: None,
             input: input.to_string(),
             palette_sel: app.palette_sel,
+            marks: app.marks.clone(),
             toast: app.toast.clone(),
             quit_requested: false,
         };
@@ -1704,5 +1976,28 @@ mod tests {
         let hc: String = help.chars().filter(|c| !c.is_whitespace()).collect();
         assert!(hc.contains("╭帮助"), "帮助应是圆角对话框");
         assert!(hc.contains("空格或/record"), "帮助应写真实可用的键");
+    }
+
+    #[test]
+    fn render_arg_palette_and_marks() {
+        let today = chrono::Local::now().date_naive();
+        let app = demo_app(today, "argpal");
+        let scr = render(&app, "/model qwen3", 100, 28);
+        let compact: String = scr.chars().filter(|c| !c.is_whitespace()).collect();
+        assert!(compact.contains("╭模型"), "参数面板应有圆角边框和标题");
+        assert!(
+            compact.contains("qwen3-asr-flash"),
+            "面板里应有过滤后的模型"
+        );
+        assert!(
+            !compact.contains("qwen-audio-3.1-asr-flash\n"),
+            "没匹配的不该排前面"
+        );
+
+        let mut marked = demo_app(today, "marks");
+        let first_id = marked.all[marked.shown[0]].id.clone();
+        marked.marks.insert(first_id);
+        let scr = render(&marked, "", 100, 28);
+        assert!(scr.contains("✓"), "被标记的条目应有 ✓ 标记");
     }
 }
