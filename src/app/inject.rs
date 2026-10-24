@@ -3,7 +3,8 @@
 //! 策略（由强到弱，和原版 LazyTyper 一致：剪贴板 + 模拟粘贴键，失败再退化为只复制）：
 //! 1. 存一份原剪贴板 → 写入新文本
 //! 2. 模拟粘贴快捷键：Wayland 优先 `wtype`/`ydotool`，X11 用 `xdotool`
-//! 3. 400 ms 后把原剪贴板还回去（不污染用户的剪贴板）
+//! 3. 确认自动粘贴成功后，400 ms 把原剪贴板还回去（不污染用户的剪贴板）；
+//!    没粘上（或 clipboard 模式）时保留新文本——用户还要手动 Ctrl+V，不能盖回去
 //! 4. 一个都不可用时只留剪贴板，并明确告诉用户“按 Ctrl+V”
 
 use std::io::Write;
@@ -59,13 +60,19 @@ pub fn deliver(text: &str, mode: Mode) -> Result<String> {
     }
 
     // 2) 模拟粘贴
+    let mut pasted = false;
     let mut how = "已复制到剪贴板（按 Ctrl+V 粘贴）".to_string();
     if mode == Mode::Auto {
         match send_paste(wayland) {
-            Some("xdotool") if wayland => how =
-                "已复制到剪贴板，并尝试过 xdotool（只对 XWayland 窗口有效）——没粘贴上就按 Ctrl+V"
-                    .into(),
-            Some(tool) => how = format!("已粘贴（{tool}）"),
+            Some("xdotool") if wayland => {
+                pasted = true;
+                how = "已复制到剪贴板，并尝试过 xdotool（只对 XWayland 窗口有效）——没粘贴上就按 Ctrl+V"
+                    .into();
+            }
+            Some(tool) => {
+                pasted = true;
+                how = format!("已粘贴（{tool}）");
+            }
             None => {
                 how = if wayland {
                     "已复制到剪贴板；Wayland 下自动粘贴需要 wtype 或 ydotool，当前都没有——按 Ctrl+V"
@@ -77,14 +84,17 @@ pub fn deliver(text: &str, mode: Mode) -> Result<String> {
         }
     }
 
-    // 3) 还回剪贴板（延迟，等粘贴动作读完）
-    if let Some(prev) = previous {
-        std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(400));
-            if !prev.is_empty() {
-                write_clipboard(&prev);
-            }
-        });
+    // 3) 还回剪贴板（延迟，等粘贴动作读完）。只在粘贴成功时做：
+    //    目标窗口已经把文本读走了；否则用户接下来要手动 Ctrl+V，还原等于把旧内容盖回去。
+    if pasted {
+        if let Some(prev) = previous {
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(400));
+                if !prev.is_empty() {
+                    write_clipboard(&prev);
+                }
+            });
+        }
     }
     Ok(how)
 }
