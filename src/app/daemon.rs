@@ -224,6 +224,32 @@ impl Daemon {
         Ok(())
     }
 
+    /// 重转上一次送服务端的音频（`keep_audio` 留的 last.wav）。
+    fn retry(&mut self) {
+        if !matches!(self.phase, Phase::Idle) {
+            self.last_error = Some("正在录音/转写，等它结束再重试".into());
+            return;
+        }
+        let path = crate::core::config::status_path()
+            .parent()
+            .map(|d| d.join("last.wav"))
+            .unwrap_or_else(|| std::env::temp_dir().join("last.wav"));
+        if !path.exists() {
+            self.last_error = Some("没有保留的音频——keep_audio = true 后的录音才能重转".into());
+            return;
+        }
+        match crate::audio::read_wav(&path) {
+            Ok((rate, pcm)) if !pcm.is_empty() => {
+                let secs = pcm.len() as f32 / rate as f32;
+                self.phase = Phase::Transcribing(Instant::now());
+                self.last_error = None;
+                self.spawn_batch(rate, pcm, secs);
+            }
+            Ok(_) => self.last_error = Some("last.wav 是空的".into()),
+            Err(e) => self.last_error = Some(format!("读 last.wav 失败：{e}")),
+        }
+    }
+
     /// 取消本次录音（不转写）。
     pub fn cancel(&mut self) {
         if matches!(self.phase, Phase::Recording(_)) {
@@ -355,6 +381,7 @@ impl Daemon {
             "start" => self.start(),
             "stop" => self.stop(),
             "quit" => self.quit = true,
+            "retry" => self.retry(),
             other => self.last_error = Some(format!("未知控制命令：{other}")),
         }
     }

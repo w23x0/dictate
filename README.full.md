@@ -28,7 +28,7 @@ git clone https://github.com/w23x0/dictate && cd dictate && ./install.sh --local
 ## 日常使用
 
 ```bash
-dictate              # 托盘常驻（开机自启跑的就是这个）：热键说话，托盘菜单手动录音/看历史/设置
+dictate              # 托盘常驻（开机自启跑的就是这个）：热键说话，托盘菜单手动录音/重转/看历史/设置
 dictate history      # 终端里看历史（实时刷新，跟着守护进程走）
 dictate settings     # 改配置（模型、地址、key、热键、交付方式）——保存后托盘即时生效，不用重启
 ```
@@ -103,10 +103,12 @@ dictate doctor       # 不录音，验 key / 区域 / 模型 / 粘贴能力 / �
 | `/model` `/base` | 敲个空格后面板里选；直接带参数 = 原样设置 |
 | `/key sk-…`（输入行自动打码）· `/hotkey ctrl+space` · `/mode hold\|toggle` | 改了立即写配置 |
 | `/record` | 手动开关录音 |
+| `/retry` | 重转上一次的音频（需 `keep_audio = true`；托盘菜单也有） |
 | `/search 文字` | 过滤历史（直接打字也实时过滤） |
 | `/clear` · `/daemon stop` | 清空历史 / 退守护进程（回车确认） |
 | `/help` · `/quit` | 帮助 / 退出视图 |
 
+复制走 OSC 52（SSH 里也落到本地剪贴板；tmux 里自动套 passthrough，需 `allow-passthrough on`）。
 键：`↑↓`/`j k` 选择 · `g` 最新 `G` 最旧 · `Ctrl+D/U` 翻半页 · `m` 标记多条 ·
 `⏎` 复制选中（有标记则整批复制，OSC 52）· `Del` 删除 · `空格` 手动录音 ·
 `F1` 帮助 · `F2` 设置 · `F10`/`Esc`/`Ctrl+C` 退出视图 ·
@@ -149,7 +151,7 @@ src/
 ## 开发
 
 ```bash
-cargo test            # 76 条：AGC/VAD/重采样/WAV、三种报文形状真 socket 端到端、命令/参数面板、标记复制、流式会话端到端、离屏渲染快照、历史 CRUD
+cargo test            # 77 条：AGC/VAD/重采样/WAV、三种报文形状真 socket 端到端、命令/参数面板、标记复制、流式会话端到端、离屏渲染快照、历史 CRUD
 cargo clippy --all-targets
 cargo fmt
 ```

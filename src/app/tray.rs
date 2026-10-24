@@ -19,11 +19,12 @@ pub fn run(cfg: Config) -> Result<()> {
 
     let menu = Menu::new();
     let record = MenuItem::with_id("record", "录一段", true, None);
+    let retry = MenuItem::with_id("retry", "重转上一条", true, None);
     let history = MenuItem::with_id("history", "打开历史…", true, None);
     let settings = MenuItem::with_id("settings", "设置…", true, None);
     let sep = PredefinedMenuItem::separator();
     let quit = MenuItem::with_id("quit", "退出", true, None);
-    menu.append_items(&[&record, &history, &settings, &sep, &quit])?;
+    menu.append_items(&[&record, &retry, &history, &settings, &sep, &quit])?;
 
     let icon = Icon::from_rgba(crate::ui::icon::rgba(), 64, 64)?;
     let tray = TrayIconBuilder::new()
@@ -45,6 +46,9 @@ pub fn run(cfg: Config) -> Result<()> {
                         "start"
                     };
                     let _ = std::fs::write(crate::core::config::control_path(), cmd);
+                }
+                "retry" => {
+                    let _ = std::fs::write(crate::core::config::control_path(), "retry");
                 }
                 "history" => {
                     let _ = crate::app::desktop::spawn_terminal("history");
@@ -92,11 +96,12 @@ pub fn run(cfg: Config) -> Result<()> {
 
     let menu = Menu::new();
     let record = MenuItem::with_id("record", "录一段", true, None);
+    let retry = MenuItem::with_id("retry", "重转上一条", true, None);
     let history = MenuItem::with_id("history", "打开历史…", true, None);
     let settings = MenuItem::with_id("settings", "设置…", true, None);
     let sep = PredefinedMenuItem::separator();
     let quit = MenuItem::with_id("quit", "退出", true, None);
-    menu.append_items(&[&record, &history, &settings, &sep, &quit])?;
+    menu.append_items(&[&record, &retry, &history, &settings, &sep, &quit])?;
 
     let icon = Icon::from_rgba(crate::ui::icon::rgba(), 64, 64)?;
     let tray = TrayIconBuilder::new()
@@ -118,6 +123,9 @@ pub fn run(cfg: Config) -> Result<()> {
                         "start"
                     };
                     let _ = std::fs::write(crate::core::config::control_path(), cmd);
+                }
+                "retry" => {
+                    let _ = std::fs::write(crate::core::config::control_path(), "retry");
                 }
                 "history" => {
                     let _ = crate::app::desktop::spawn_terminal("history");

@@ -83,6 +83,7 @@ const COMMANDS: &[(&str, &str, &str)] = &[
     ("/hotkey", "[组合键]", "设置热键，如 ctrl+space"),
     ("/mode", "hold|toggle", "热键语义：按住说话 / 按一下开关"),
     ("/record", "", "手动开始或停止录音"),
+    ("/retry", "", "重转上一次的音频（需 keep_audio）"),
     ("/search", "[文字]", "按内容过滤历史"),
     ("/clear", "", "清空全部历史（需确认）"),
     ("/refresh", "", "重新读历史文件"),
@@ -416,7 +417,7 @@ fn error_hint(note: &str) -> &'static str {
     } else if n.contains("超时") || n.contains("timeout") {
         "网络不通或太慢：/base 换个区域，或稍后再试"
     } else {
-        "dictate doctor 可整链路体检"
+        "keep_audio 开着可 /retry 重转；仍不行跑 dictate doctor"
     }
 }
 
@@ -447,7 +448,20 @@ fn day_label(ts: &str) -> String {
 pub fn osc52(text: &str) -> String {
     use base64::Engine;
     let b64 = base64::engine::general_purpose::STANDARD.encode(text.as_bytes());
-    format!("\x1b]52;c;{b64}\x07")
+    wrap_for_tmux(
+        &format!("\x1b]52;c;{b64}\x07"),
+        std::env::var_os("TMUX").is_some(),
+    )
+}
+
+/// tmux 会吞掉应用的裸 OSC 序列；在 tmux 里用 DCS passthrough 包一层，
+/// 内部的 ESC 双写。（tmux ≥3.3 要 allow-passthrough on；不满足时静默失效，
+/// 不比不包差。）
+fn wrap_for_tmux(seq: &str, in_tmux: bool) -> String {
+    if !in_tmux {
+        return seq.to_string();
+    }
+    format!("\x1bPtmux;{}\x1b\\", seq.replace('\x1b', "\x1b\x1b"))
 }
 
 /// `dictate history`：只读视图，但**实时**（轮询守护进程状态 + 历史文件）。
@@ -972,6 +986,10 @@ fn run_input(app: &mut App) -> Result<()> {
             }
         }
         "/record" => toggle_record(app),
+        "/retry" => {
+            send_control("retry");
+            toast(app, "已请求重转（结果进历史并交付）");
+        }
         "/search" => {
             app.query = arg.clone();
             app.refilter();
@@ -1592,10 +1610,19 @@ mod tests {
 
     #[test]
     fn osc52_encodes_text() {
-        let s = osc52("你好");
+        let s = wrap_for_tmux("\x1b]52;c;5L2g5aW9\x07", false);
         assert!(s.starts_with("\x1b]52;c;"));
         assert!(s.ends_with('\x07'));
         assert!(s.contains("5L2g5aW9"));
+    }
+
+    #[test]
+    fn osc52_wraps_for_tmux_passthrough() {
+        let s = wrap_for_tmux("\x1b]52;c;5L2g5aW9\x07", true);
+        assert!(s.starts_with("\x1bPtmux;"), "DCS 开头：{s:?}");
+        assert!(s.ends_with("\x1b\\"), "DCS 结尾：{s:?}");
+        // 里面的 ESC 要双写，否则 tmux 解不开
+        assert!(s.contains("\x1b\x1b]52;c;"), "ESC 双写：{s:?}");
     }
 
     // ── 命令面板 ──
@@ -2121,7 +2148,7 @@ mod tests {
         assert!(error_hint("失败：HTTP 429 Too Many Requests").contains("限流"));
         assert!(error_hint("没有检测到语音：峰值 -90 dBFS，低于门限 -35 dBFS").contains("probe"));
         assert!(error_hint("失败：请求超时").contains("/base"));
-        assert_eq!(error_hint("失败：别的什么"), "dictate doctor 可整链路体检");
+        assert!(error_hint("失败：别的什么").contains("/retry"));
     }
 
     #[test]

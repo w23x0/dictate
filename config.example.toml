@@ -28,3 +28,7 @@ timeout_secs = 60
 # 真流式（边说边出字）：WebSocket 系模型（-message / -streaming / -realtime）生效，
 # 失败自动回退「录完整段再转」。批量模型（qwen3-asr-flash 等）忽略此项。
 streaming = true
+
+# 把每次送到服务端的 WAV 留一份到 ~/.local/share/dictate/last.wav，
+# 转写失败后可用 /retry 或托盘菜单「重转上一条」重转，不用重说
+keep_audio = false
