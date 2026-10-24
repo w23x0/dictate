@@ -331,9 +331,23 @@ pub fn read_wav(path: &std::path::Path) -> Result<(u32, Vec<f32>)> {
 
 // ───────────────────────── 热键守护用的可停采集 ─────────────────────────
 
-/// 采集线程的命令。`Start` 带最长时长，到点由采集线程自己停。
+/// 流式输出：采集线程把单声道样本（设备原生采样率）实时吐给转写会话。
+pub enum CaptureOut {
+    /// 一段录音开始，带设备采样率（会话据此建重采样器）
+    Begin { rate: u32 },
+    /// 单声道 f32 块
+    Chunk(Vec<f32>),
+    /// 本段录音结束（stop 之后由采集线程发出）
+    Finish,
+}
+
+/// 采集线程的命令。`Start` 带最长时长，到点由采集线程自己停；
+/// `fwd` 有值时同时把样本实时转发出去（真流式用）。
 pub enum CaptureCmd {
-    Start { max_seconds: f32 },
+    Start {
+        max_seconds: f32,
+        fwd: Option<tokio::sync::mpsc::UnboundedSender<CaptureOut>>,
+    },
     Stop,
     Quit,
 }
@@ -347,7 +361,25 @@ pub struct Capture {
 impl Capture {
     pub fn start(&self, max_seconds: f32) -> anyhow::Result<()> {
         self.cmd
-            .send(CaptureCmd::Start { max_seconds })
+            .send(CaptureCmd::Start {
+                max_seconds,
+                fwd: None,
+            })
+            .map_err(|_| anyhow!("采集线程已退出"))?;
+        Ok(())
+    }
+
+    /// 开录并实时转发样本（真流式）。
+    pub fn start_stream(
+        &self,
+        max_seconds: f32,
+        fwd: tokio::sync::mpsc::UnboundedSender<CaptureOut>,
+    ) -> anyhow::Result<()> {
+        self.cmd
+            .send(CaptureCmd::Start {
+                max_seconds,
+                fwd: Some(fwd),
+            })
             .map_err(|_| anyhow!("采集线程已退出"))?;
         Ok(())
     }
@@ -379,7 +411,7 @@ pub fn spawn_capture(device_name: Option<String>) -> anyhow::Result<Capture> {
             match cmd {
                 CaptureCmd::Quit => return,
                 CaptureCmd::Stop => {}
-                CaptureCmd::Start { max_seconds } => {
+                CaptureCmd::Start { max_seconds, fwd } => {
                     let Ok(device) = quiet(|| open_input(device_name.as_deref())) else {
                         eprintln!("[audio] 打不开输入设备");
                         continue;
@@ -396,27 +428,44 @@ pub fn spawn_capture(device_name: Option<String>) -> anyhow::Result<Capture> {
                     let sink = Arc::clone(&buf);
                     let err_fn = |e| eprintln!("[audio] 采集流错误：{e}");
 
+                    // 先告诉流式会话采样率（之后回调里的块都在它后面进 channel）
+                    if let Some(tx) = &fwd {
+                        let _ = tx.send(CaptureOut::Begin { rate });
+                    }
+
                     let stream = match format {
-                        cpal::SampleFormat::F32 => device.build_input_stream(
-                            &config,
-                            move |data: &[f32], _: &cpal::InputCallbackInfo| {
-                                let mono = to_mono(data, channels);
-                                sink.lock().unwrap().extend_from_slice(&mono);
-                            },
-                            err_fn,
-                            None,
-                        ),
-                        cpal::SampleFormat::I16 => device.build_input_stream(
-                            &config,
-                            move |data: &[i16], _: &cpal::InputCallbackInfo| {
-                                let f: Vec<f32> =
-                                    data.iter().map(|s| *s as f32 / 32768.0).collect();
-                                let mono = to_mono(&f, channels);
-                                sink.lock().unwrap().extend_from_slice(&mono);
-                            },
-                            err_fn,
-                            None,
-                        ),
+                        cpal::SampleFormat::F32 => {
+                            let fwd = fwd.clone();
+                            device.build_input_stream(
+                                &config,
+                                move |data: &[f32], _: &cpal::InputCallbackInfo| {
+                                    let mono = to_mono(data, channels);
+                                    sink.lock().unwrap().extend_from_slice(&mono);
+                                    if let Some(tx) = &fwd {
+                                        let _ = tx.send(CaptureOut::Chunk(mono));
+                                    }
+                                },
+                                err_fn,
+                                None,
+                            )
+                        }
+                        cpal::SampleFormat::I16 => {
+                            let fwd = fwd.clone();
+                            device.build_input_stream(
+                                &config,
+                                move |data: &[i16], _: &cpal::InputCallbackInfo| {
+                                    let f: Vec<f32> =
+                                        data.iter().map(|s| *s as f32 / 32768.0).collect();
+                                    let mono = to_mono(&f, channels);
+                                    sink.lock().unwrap().extend_from_slice(&mono);
+                                    if let Some(tx) = &fwd {
+                                        let _ = tx.send(CaptureOut::Chunk(mono));
+                                    }
+                                },
+                                err_fn,
+                                None,
+                            )
+                        }
                         other => {
                             eprintln!("[audio] 不支持的采样格式：{other:?}");
                             continue;
@@ -448,6 +497,9 @@ pub fn spawn_capture(device_name: Option<String>) -> anyhow::Result<Capture> {
                     let data = Arc::try_unwrap(buf)
                         .map(|m| m.into_inner().unwrap())
                         .unwrap_or_default();
+                    if let Some(tx) = &fwd {
+                        let _ = tx.send(CaptureOut::Finish);
+                    }
                     if res_tx.send((rate, data)).is_err() {
                         return;
                     }

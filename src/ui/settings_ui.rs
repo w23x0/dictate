@@ -51,7 +51,7 @@ pub(crate) const BASES: &[(&str, &str)] = &[
     ("https://dashscope-intl.aliyuncs.com", "新加坡"),
 ];
 
-const FIELDS: [&str; 13] = [
+const FIELDS: [&str; 14] = [
     "服务地址",
     "模型",
     "报文形状",
@@ -65,6 +65,7 @@ const FIELDS: [&str; 13] = [
     "超时 (s)",
     "配色 (auto/dark/light)",
     "交付方式",
+    "流式转写（边说边出字）",
 ];
 
 pub struct Form {
@@ -145,8 +146,23 @@ impl Form {
                 "clipboard" => "clipboard（只写剪贴板）".into(),
                 _ => "auto（剪贴板 + 自动粘贴）".into(),
             },
+            13 => {
+                if !self.model_supports_ws() {
+                    "关（当前模型不支持）".into()
+                } else if self.cfg.streaming {
+                    "开".into()
+                } else {
+                    "关".into()
+                }
+            }
             _ => String::new(),
         }
+    }
+
+    fn model_supports_ws(&self) -> bool {
+        crate::asr::pick_style(&self.cfg.model, self.cfg.api_style.as_deref())
+            .map(|s| s == crate::asr::Style::Ws)
+            .unwrap_or(false)
     }
 
     fn cycle_theme(&mut self, dir: i32) {
@@ -179,6 +195,16 @@ impl Form {
                 _ => "auto".into(),
             };
             self.dirty = true;
+            return;
+        }
+        if i == 13 {
+            if self.model_supports_ws() {
+                self.cfg.streaming = !self.cfg.streaming;
+                self.dirty = true;
+            } else {
+                self.status =
+                    "流式需要 WebSocket 系模型（-message / -streaming / -realtime）".into();
+            }
             return;
         }
         if i == 7 {

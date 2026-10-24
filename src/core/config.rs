@@ -43,6 +43,8 @@ pub struct Config {
     pub keep_audio: bool,
     /// 转写完成后怎么交付：`auto`（剪贴板 + 模拟粘贴）/ `clipboard` / `off`。
     pub paste: String,
+    /// 真流式（边说边出字）：WebSocket 系模型才有用；失败自动回退批量。
+    pub streaming: bool,
 }
 
 impl Default for Config {
@@ -65,6 +67,7 @@ impl Default for Config {
             input_device: None,
             keep_audio: false,
             paste: "auto".into(),
+            streaming: true,
         }
     }
 }

@@ -11,7 +11,7 @@
 
 mod dashscope;
 mod openai;
-mod ws;
+pub(crate) mod ws;
 
 #[cfg(test)]
 mod e2e;

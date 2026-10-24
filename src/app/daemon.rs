@@ -1,15 +1,18 @@
 //! 无终端常驻：热键 → 采集 → 转写 → 历史，状态给托盘用。
+//!
+//! 支持真流式（WebSocket 系模型 + `streaming = true`）：边说边出字，
+//! 中间文本实时写进 `status.json` 给终端视图。流式会话失败（断网、超时）
+//! 自动回退到「录完整段再批量转写」——采集线程本来就留了整段样本，一个字不丢。
 
 use std::sync::mpsc::{channel, Receiver, Sender};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 
 use crate::audio::Capture;
 use crate::core::config::Config;
-use crate::core::history::History;
+use crate::core::history::{new_id, now_rfc3339, Entry, History};
 use crate::hotkey::{self, HotkeyEvent};
-use crate::pipeline;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Phase {
@@ -18,11 +21,33 @@ pub enum Phase {
     Transcribing(Instant),
 }
 
-/// 转写线程 → 主循环的结果通道。
-type Worker = (
-    Sender<Result<String, String>>,
-    Receiver<Result<String, String>>,
-);
+/// 转写线程 → 主循环的通道。历史落库统一在主循环做（只有它拿得到录音时长）。
+type Worker = (Sender<WorkerOut>, Receiver<WorkerOut>);
+
+struct DoneText {
+    text: String,
+    latency_ms: u64,
+}
+
+enum WorkerOut {
+    /// 流式中间结果（已定稿句子 + 当前半句）
+    Partial(String),
+    /// `Ok` = 拿到完整文本；`Err` = 流式或批量失败的原因
+    Done(Result<DoneText, String>),
+}
+
+/// 一次录音在等谁的结果。
+enum Awaiting {
+    None,
+    /// 流式会话进行中；stop 之后完整 PCM 留在这里备回退
+    Stream {
+        pcm: Option<(u32, Vec<f32>, f32)>,
+    },
+    /// 批量转写中（含流式失败后的回退）
+    Batch {
+        secs: f32,
+    },
+}
 
 pub struct Daemon {
     cfg: Config,
@@ -30,9 +55,14 @@ pub struct Daemon {
     capture: Capture,
     hk: Receiver<HotkeyEvent>,
     hk_spec: hotkey::SharedSpec,
-    worker: Worker,
     /// 上次看到的配置文件 mtime；变了就热加载（模型/key/交付方式/热键都不用重启）。
     cfg_mtime: Option<std::time::SystemTime>,
+    worker: Worker,
+    awaiting: Awaiting,
+    /// 流式会话在录音阶段就挂了：松开后直接走批量
+    stream_dead: bool,
+    /// 流式中间文本（给托盘提示与 status.json）
+    partial: Option<String>,
     pub phase: Phase,
     /// 本次录音的开始时刻（判断"误触"用）
     started: Option<Instant>,
@@ -58,8 +88,11 @@ impl Daemon {
             capture,
             hk,
             hk_spec,
-            worker: channel(),
             cfg_mtime,
+            worker: channel(),
+            awaiting: Awaiting::None,
+            stream_dead: false,
+            partial: None,
             phase: Phase::Idle,
             started: None,
             quit: false,
@@ -81,6 +114,11 @@ impl Daemon {
             "since_ms": since,
             "text": self.last_text,
             "error": self.last_error,
+            "partial": if matches!(self.phase, Phase::Recording(_)) {
+                self.partial.clone()
+            } else {
+                None
+            },
         });
         let body = v.to_string();
         if body == self.published {
@@ -97,19 +135,93 @@ impl Daemon {
         }
     }
 
+    /// 流式可用：开关开着 + 模型是 WebSocket 系 + key 拿得到。
+    fn streaming_ready(&self) -> bool {
+        self.cfg.streaming
+            && crate::asr::pick_style(&self.cfg.model, self.cfg.api_style.as_deref())
+                .map(|s| s == crate::asr::Style::Ws)
+                .unwrap_or(false)
+            && crate::asr::QwenClient::from_config(&self.cfg).is_ok()
+    }
+
     /// 手动开始录音（来自终端视图或托盘）。
     pub fn start(&mut self) {
         if self.phase != Phase::Idle {
             return;
         }
-        match self.capture.start(self.cfg.max_seconds) {
+        let max = self.cfg.max_seconds;
+        let want_stream = self.streaming_ready();
+        let mut streamed = false;
+        // 流式起不来（没设备/key 问题的边缘情况）就当场退回批量开录
+        let r = if want_stream {
+            match self.begin_stream(max) {
+                Ok(()) => {
+                    streamed = true;
+                    Ok(())
+                }
+                Err(e) => {
+                    eprintln!("[daemon] 流式起不来，退回批量：{e:#}");
+                    self.capture.start(max)
+                }
+            }
+        } else {
+            self.capture.start(max)
+        };
+        match r {
             Ok(()) => {
                 self.started = Some(Instant::now());
                 self.phase = Phase::Recording(Instant::now());
                 self.last_error = None;
+                self.partial = None;
+                self.stream_dead = false;
+                self.awaiting = if streamed {
+                    Awaiting::Stream { pcm: None }
+                } else {
+                    Awaiting::None
+                };
             }
             Err(e) => self.last_error = Some(format!("启动录音失败：{e}")),
         }
+    }
+
+    /// 起一路真流式：采集转发 → WS 会话线程 → 事件回主循环。
+    fn begin_stream(&mut self, max: f32) -> anyhow::Result<()> {
+        let client = crate::asr::QwenClient::from_config(&self.cfg)?;
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        self.capture.start_stream(max, tx)?;
+        let worker_tx = self.worker.0.clone();
+        std::thread::spawn(move || {
+            let (ev_tx, ev_rx) = channel::<crate::asr::ws::StreamEvent>();
+            let inner = ev_tx.clone();
+            let session = std::thread::spawn(move || {
+                crate::asr::ws::stream_session(client, rx, inner);
+            });
+            drop(ev_tx);
+            let started = Instant::now();
+            let mut ok: Option<String> = None;
+            let mut err: Option<String> = None;
+            // 会话线程（持有唯一剩下的 sender）结束后 iter() 自然终止
+            for ev in ev_rx.iter() {
+                match ev {
+                    crate::asr::ws::StreamEvent::Partial(p) => {
+                        let _ = worker_tx.send(WorkerOut::Partial(p));
+                    }
+                    crate::asr::ws::StreamEvent::Final(Ok(t)) => ok = Some(t),
+                    crate::asr::ws::StreamEvent::Final(Err(e)) => err = Some(e),
+                }
+            }
+            let _ = session.join();
+            let out = match (ok, err) {
+                (Some(text), _) => Ok(DoneText {
+                    text,
+                    latency_ms: started.elapsed().as_millis() as u64,
+                }),
+                (None, Some(e)) => Err(e),
+                (None, None) => Err("流式会话没有产出结果".into()),
+            };
+            let _ = worker_tx.send(WorkerOut::Done(out));
+        });
+        Ok(())
     }
 
     /// 取消本次录音（不转写）。
@@ -119,6 +231,9 @@ impl Daemon {
             self.phase = Phase::Idle;
             self.started = None;
             self.last_error = None;
+            self.partial = None;
+            // 迟到的 Done 会在 tick 里因 Awaiting::None 被丢弃
+            self.awaiting = Awaiting::None;
         }
     }
 
@@ -129,7 +244,7 @@ impl Daemon {
         }
         // 误触：按一下就松（< 200 ms）直接丢弃，免得每次点错都产生一条空记录
         let elapsed = self.started.map(|t| t.elapsed()).unwrap_or_default();
-        if elapsed < std::time::Duration::from_millis(200) {
+        if elapsed < Duration::from_millis(200) {
             self.cancel();
             self.last_error = Some("按键太短，已忽略".into());
             return;
@@ -139,21 +254,94 @@ impl Daemon {
             Ok((rate, pcm)) => {
                 let secs = pcm.len() as f32 / rate as f32;
                 self.phase = Phase::Transcribing(Instant::now());
-                let cfg = self.cfg.clone();
-                let hist = History::new(crate::core::config::history_path());
-                let tx = self.worker.0.clone();
-                std::thread::spawn(move || {
-                    let out = pipeline::prepare_wav(&cfg, &pcm, rate)
-                        .and_then(|wav| pipeline::transcribe_and_record(&cfg, &hist, &wav, secs))
-                        .map_err(|e| format!("{e:#}"));
-                    let _ = tx.send(out);
-                });
+                let prev = std::mem::replace(&mut self.awaiting, Awaiting::None);
+                match prev {
+                    // 会话早就挂了：拿着整段样本直接批量
+                    Awaiting::Stream { .. } if self.stream_dead => {
+                        self.spawn_batch(rate, pcm, secs)
+                    }
+                    Awaiting::Stream { .. } => {
+                        self.awaiting = Awaiting::Stream {
+                            pcm: Some((rate, pcm, secs)),
+                        };
+                    }
+                    _ => self.spawn_batch(rate, pcm, secs),
+                }
             }
             Err(e) => {
                 self.phase = Phase::Idle;
                 self.last_error = Some(format!("取录音失败：{e}"));
             }
         }
+    }
+
+    /// 批量转写（也承担流式失败后的回退）。
+    fn spawn_batch(&mut self, rate: u32, pcm: Vec<f32>, secs: f32) {
+        self.awaiting = Awaiting::Batch { secs };
+        let cfg = self.cfg.clone();
+        let tx = self.worker.0.clone();
+        std::thread::spawn(move || {
+            let out = crate::pipeline::prepare_wav(&cfg, &pcm, rate)
+                .and_then(|wav| {
+                    let t = crate::asr::QwenClient::from_config(&cfg)?.transcribe_wav(&wav)?;
+                    Ok(DoneText {
+                        text: t.text,
+                        latency_ms: t.latency_ms,
+                    })
+                })
+                .map_err(|e| format!("{e:#}"));
+            let _ = tx.send(WorkerOut::Done(out));
+        });
+    }
+
+    fn finish_ok(&mut self, dt: DoneText, secs: f32) {
+        self.awaiting = Awaiting::None;
+        let hist = History::new(crate::core::config::history_path());
+        hist.append(&Entry {
+            id: new_id(),
+            ts: now_rfc3339(),
+            duration_ms: (secs * 1000.0) as u64,
+            latency_ms: dt.latency_ms,
+            model: self.cfg.model.clone(),
+            status: "ok".into(),
+            text: dt.text.clone(),
+        })
+        .ok();
+        // 识别完直接送到当前焦点窗口（剪贴板 + 模拟粘贴）
+        let mode = crate::app::inject::Mode::parse(&self.cfg.paste);
+        match crate::app::inject::deliver(&dt.text, mode) {
+            Ok(how) => {
+                self.last_text = Some(dt.text);
+                self.paste_note = Some(how);
+                self.last_error = None;
+            }
+            Err(e) => {
+                self.last_text = Some(dt.text);
+                self.paste_note = None;
+                self.last_error = Some(format!("交付失败：{e}"));
+            }
+        }
+        self.phase = Phase::Idle;
+        self.partial = None;
+    }
+
+    fn finish_err(&mut self, e: String, secs: f32) {
+        // 失败也写一条错误历史（沿用原行为），返回值仍然是错误
+        let hist = History::new(crate::core::config::history_path());
+        hist.append(&Entry {
+            id: new_id(),
+            ts: now_rfc3339(),
+            duration_ms: (secs * 1000.0) as u64,
+            latency_ms: 0,
+            model: self.cfg.model.clone(),
+            status: format!("error: {e}"),
+            text: String::new(),
+        })
+        .ok();
+        self.awaiting = Awaiting::None;
+        self.last_error = Some(e);
+        self.phase = Phase::Idle;
+        self.partial = None;
     }
 
     /// 读一次控制文件（终端视图 / 外部脚本下命令）。
@@ -212,26 +400,46 @@ impl Daemon {
             }
         }
 
+        // 流式卡死兜底：超时还等不到 Final，就带着整段样本回退批量
+        if let Phase::Transcribing(t) = self.phase {
+            let budget = Duration::from_secs(self.cfg.timeout_secs.max(30) + 10);
+            if t.elapsed() > budget {
+                if let Awaiting::Stream {
+                    pcm: Some((rate, pcm, secs)),
+                } = std::mem::replace(&mut self.awaiting, Awaiting::None)
+                {
+                    self.last_error = Some("流式超时，回退批量转写".into());
+                    self.spawn_batch(rate, pcm, secs);
+                }
+            }
+        }
+
         while let Ok(out) = self.worker.1.try_recv() {
-            self.phase = Phase::Idle;
             match out {
-                Ok(text) => {
-                    // 原版逻辑：识别完直接送到当前焦点窗口（剪贴板 + 模拟粘贴）
-                    let mode = crate::app::inject::Mode::parse(&self.cfg.paste);
-                    match crate::app::inject::deliver(&text, mode) {
-                        Ok(how) => {
-                            self.last_text = Some(text);
-                            self.paste_note = Some(how);
-                            self.last_error = None;
-                        }
-                        Err(e) => {
-                            self.last_text = Some(text);
-                            self.paste_note = None;
-                            self.last_error = Some(format!("交付失败：{e}"));
-                        }
+                WorkerOut::Partial(p) => self.partial = Some(p),
+                WorkerOut::Done(res) => {
+                    let prev = std::mem::replace(&mut self.awaiting, Awaiting::None);
+                    match prev {
+                        // 已取消/过期，丢弃
+                        Awaiting::None => {}
+                        // 还在录音阶段就出 Final：只可能是失败——标记后等松开走批量
+                        Awaiting::Stream { pcm: None } => match res {
+                            Ok(dt) => self.finish_ok(dt, 0.0),
+                            Err(_) => self.stream_dead = true,
+                        },
+                        Awaiting::Stream {
+                            pcm: Some((rate, pcm, secs)),
+                        } => match res {
+                            Ok(dt) => self.finish_ok(dt, secs),
+                            // 流式失败：整段样本还在，批量来一遍
+                            Err(_) => self.spawn_batch(rate, pcm, secs),
+                        },
+                        Awaiting::Batch { secs } => match res {
+                            Ok(dt) => self.finish_ok(dt, secs),
+                            Err(e) => self.finish_err(e, secs),
+                        },
                     }
                 }
-                Err(e) => self.last_error = Some(e),
             }
         }
 
@@ -246,9 +454,14 @@ impl Daemon {
                 ),
                 (None, None) => "dictate — 就绪".to_string(),
             },
-            Phase::Recording(t) => {
-                format!("dictate — ● 录音中 {:.1}s", t.elapsed().as_secs_f32())
-            }
+            Phase::Recording(t) => match self.partial.as_deref() {
+                Some(p) if !p.is_empty() => format!(
+                    "dictate — ● {:.1}s {}",
+                    t.elapsed().as_secs_f32(),
+                    truncate(p, 24)
+                ),
+                _ => format!("dictate — ● 录音中 {:.1}s", t.elapsed().as_secs_f32()),
+            },
             Phase::Transcribing(t) => {
                 format!("dictate — ◐ 转写中 {:.1}s", t.elapsed().as_secs_f32())
             }

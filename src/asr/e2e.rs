@@ -198,3 +198,121 @@ fn websocket_shape_end_to_end() {
     let fin: Value = serde_json::from_str(&seen[1]).unwrap();
     assert_eq!(fin["header"]["action"], "finish-task");
 }
+
+/// 假 WS 服务端（流式版）：收到第一帧音频就给中间结果，
+/// 收到 finish-task 给定稿句子和 task-finished。
+fn ws_stream_server() -> (String, std::thread::JoinHandle<Vec<String>>) {
+    let (port_tx, port_rx) = std::sync::mpsc::channel();
+    let handle = std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async move {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            port_tx.send(listener.local_addr().unwrap().port()).unwrap();
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+
+            let mut seen = Vec::new();
+            if let Some(Ok(tokio_tungstenite::tungstenite::Message::Text(t))) = ws.next().await {
+                seen.push(t.to_string());
+            }
+            ws.send(tokio_tungstenite::tungstenite::Message::Text(
+                json!({"header":{"event":"task-started","task_id":"t"}}).to_string(),
+            ))
+            .await
+            .unwrap();
+
+            let mut audio_bytes = 0usize;
+            let mut partial_sent = false;
+            loop {
+                match ws.next().await {
+                    Some(Ok(tokio_tungstenite::tungstenite::Message::Binary(b))) => {
+                        audio_bytes += b.len();
+                        if !partial_sent {
+                            partial_sent = true;
+                            ws.send(tokio_tungstenite::tungstenite::Message::Text(
+                                json!({"header":{"event":"result-generated"},
+                                       "payload":{"output":{"sentence":{"text":"你好，","sentence_end":false}}}})
+                                .to_string(),
+                            ))
+                            .await
+                            .unwrap();
+                        }
+                    }
+                    Some(Ok(tokio_tungstenite::tungstenite::Message::Text(t))) => {
+                        seen.push(t.to_string());
+                        break;
+                    }
+                    _ => break,
+                }
+            }
+            // 100 ms 的块重采样后可能不足一整帧，Finish 会把尾帧刷出来：
+            // 只要求「有 PCM 且是 16bit 对齐」
+            assert!(
+                audio_bytes >= 2000 && audio_bytes.is_multiple_of(2),
+                "应有 16bit 对齐的 PCM 到达（{audio_bytes} 字节）"
+            );
+
+            ws.send(tokio_tungstenite::tungstenite::Message::Text(
+                json!({"header":{"event":"result-generated"},
+                       "payload":{"output":{"sentence":{"text":"你好，世界。","sentence_end":true}}}})
+                .to_string(),
+            ))
+            .await
+            .unwrap();
+            ws.send(tokio_tungstenite::tungstenite::Message::Text(
+                json!({"header":{"event":"task-finished"}}).to_string(),
+            ))
+            .await
+            .unwrap();
+            seen
+        })
+    });
+    let port = port_rx.recv().unwrap();
+    (format!("http://127.0.0.1:{port}"), handle)
+}
+
+#[test]
+fn websocket_stream_session_end_to_end() {
+    use super::ws::StreamEvent;
+    use crate::audio::CaptureOut;
+
+    let (base, srv) = ws_stream_server();
+    let c = client(base, "qwen3-asr-flash-realtime", Style::Ws);
+
+    // 100 ms @ 48 kHz 的单声道块 → 重采样后正好一帧 16 kHz PCM
+    let (atx, arx) = tokio::sync::mpsc::unbounded_channel();
+    atx.send(CaptureOut::Begin { rate: 48_000 }).unwrap();
+    atx.send(CaptureOut::Chunk(vec![0.1f32; 4800])).unwrap();
+    atx.send(CaptureOut::Finish).unwrap();
+    drop(atx);
+
+    let (etx, erx) = std::sync::mpsc::channel();
+    super::ws::stream_session(c, arx, etx);
+
+    let mut partials = Vec::new();
+    let mut final_text: Option<Result<String, String>> = None;
+    for ev in erx.iter() {
+        match ev {
+            StreamEvent::Partial(p) => partials.push(p),
+            StreamEvent::Final(r) => final_text = Some(r),
+        }
+    }
+    assert_eq!(final_text.expect("必须有 Final").unwrap(), "你好，世界。");
+    assert!(
+        partials.iter().any(|p| p.contains("你好，")),
+        "应收到中间结果：{partials:?}"
+    );
+
+    let seen = srv.join().unwrap();
+    let run: Value = serde_json::from_str(&seen[0]).unwrap();
+    assert_eq!(run["payload"]["parameters"]["format"], "pcm");
+    assert_eq!(
+        run["payload"]["parameters"]["intermediate_result_enabled"],
+        true
+    );
+    let fin: Value = serde_json::from_str(&seen[1]).unwrap();
+    assert_eq!(fin["header"]["action"], "finish-task");
+}

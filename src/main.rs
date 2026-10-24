@@ -155,6 +155,16 @@ fn cmd_doctor() -> Result<()> {
     if let Some(style) = style {
         println!("报文形状：{}", style.name());
     }
+    println!(
+        "流式：{}",
+        if !cfg.streaming {
+            "关".to_string()
+        } else if style == Some(asr::Style::Ws) {
+            format!("开（{} 边说边出字）", cfg.model)
+        } else {
+            "开了但当前模型不支持（需 -message / -streaming / -realtime）".to_string()
+        }
+    );
     println!("交付能力：{}", inject::capabilities());
     #[cfg(target_os = "linux")]
     {

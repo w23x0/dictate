@@ -55,6 +55,8 @@ struct App {
     selected: usize,
     /// 守护进程状态文件里带出来的持久提示（完成/失败/没在跑），显示在第二行
     daemon_note: String,
+    /// 流式中间文本（录音中实时刷新）
+    partial: String,
     phase: Phase,
     /// 顶栏副标题（热键 · 模型），只在 run 模式有
     subtitle: String,
@@ -107,6 +109,7 @@ impl App {
             query: String::new(),
             selected: 0,
             daemon_note: String::new(),
+            partial: String::new(),
             phase: Phase::Idle,
             subtitle: String::new(),
             theme,
@@ -483,6 +486,9 @@ struct StatusFile {
     text: Option<String>,
     #[serde(default)]
     error: Option<String>,
+    /// 流式中间文本（录音中才有）
+    #[serde(default)]
+    partial: Option<String>,
 }
 
 fn init_term(term: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> {
@@ -537,6 +543,7 @@ fn apply_status_from(path: &std::path::Path, app: &mut App) {
         "transcribing" => Phase::Transcribing(at),
         _ => Phase::Idle,
     };
+    app.partial = st.partial.clone().unwrap_or_default();
     app.daemon_note = match (&st.error, &st.text) {
         (Some(e), _) => format!("失败：{e}"),
         (None, Some(t)) => format!("完成：{}", t.chars().take(40).collect::<String>()),
@@ -1193,6 +1200,41 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
         let mut state = ListState::default();
         state.select(first_item_of.get(app.selected).copied());
         f.render_stateful_widget(list, list_area, &mut state);
+    }
+
+    // ── 流式字幕：录音中把中间文本顶在列表上方，边说边出字
+    if let Phase::Recording(_) = app.phase {
+        if !app.partial.is_empty() {
+            let w = list_area.width.saturating_sub(4);
+            let lines = wrap_width(&app.partial, w as usize);
+            let n = (lines.len() as u16).min(4);
+            let rect = Rect {
+                x: list_area.x + 2,
+                y: list_area.y + 1,
+                width: w,
+                height: n,
+            };
+            clear_with_margin(f, rect);
+            let rows: Vec<Line> = lines
+                .iter()
+                .take(4)
+                .enumerate()
+                .map(|(i, l)| {
+                    let mut spans = Vec::new();
+                    if i == 0 {
+                        spans.push(Span::styled("● ", Style::default().fg(th.rec)));
+                    } else {
+                        spans.push(Span::raw("  "));
+                    }
+                    spans.push(Span::styled(l.clone(), Style::default().fg(Color::Reset)));
+                    Line::from(spans)
+                })
+                .collect();
+            f.render_widget(
+                Paragraph::new(rows).style(Style::default().bg(th.panel_bg)),
+                rect,
+            );
+        }
     }
 
     // ── 底部输入面板
@@ -1860,6 +1902,14 @@ mod tests {
         apply_status_from(&path, &mut app);
         assert!(matches!(app.phase, Phase::Recording(_)));
 
+        std::fs::write(
+            &path,
+            r#"{"phase":"recording","since_ms":0,"partial":"你好"}"#,
+        )
+        .unwrap();
+        apply_status_from(&path, &mut app);
+        assert_eq!(app.partial, "你好", "流式中间文本要进 App");
+
         std::fs::write(&path, r#"{"phase":"idle","since_ms":0,"text":"你好"}"#).unwrap();
         apply_status_from(&path, &mut app);
         assert_eq!(app.phase, Phase::Idle);
@@ -1897,6 +1947,7 @@ mod tests {
             query: app.query.clone(),
             selected: app.selected,
             daemon_note: app.daemon_note.clone(),
+            partial: app.partial.clone(),
             phase: app.phase,
             subtitle: app.subtitle.clone(),
             theme: app.theme,
@@ -2082,5 +2133,24 @@ mod tests {
         let compact: String = scr.chars().filter(|c| !c.is_whitespace()).collect();
         assert!(compact.contains("401"), "错误本身要显示");
         assert!(compact.contains("/key换个key"), "失败要带下一步建议");
+    }
+
+    #[test]
+    fn render_live_caption_while_recording() {
+        let today = chrono::Local::now().date_naive();
+        let mut app = demo_app(today, "capt");
+        app.phase = Phase::Recording(std::time::Instant::now());
+        app.partial = "今天下午三点开会，顺便对齐一下进度。".into();
+        let scr = render(&app, "", 100, 28);
+        let compact: String = scr.chars().filter(|c| !c.is_whitespace()).collect();
+        assert!(compact.contains("今天下午三点开会"), "录音中应显示流式字幕");
+        // 空闲时不显示字幕
+        let mut idle = demo_app(today, "capt2");
+        idle.partial = "残留文本".into();
+        let scr = render(&idle, "", 100, 28);
+        assert!(
+            !scr.replace(' ', "").contains("残留文本"),
+            "非录音态不该有字幕"
+        );
     }
 }

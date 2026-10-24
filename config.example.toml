@@ -24,3 +24,7 @@ target_rms_dbfs = -20.0
 silence_stop_ms = 1500
 max_seconds = 240.0
 timeout_secs = 60
+
+# 真流式（边说边出字）：WebSocket 系模型（-message / -streaming / -realtime）生效，
+# 失败自动回退「录完整段再转」。批量模型（qwen3-asr-flash 等）忽略此项。
+streaming = true

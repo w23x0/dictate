@@ -65,6 +65,15 @@ dictate doctor       # 不录音，验 key / 区域 / 模型 / 粘贴能力 / �
 - **Linux**：直读 `/dev/input/event*`（X11 / Wayland 通用），需要 `input` 组
 - **Windows**：`WH_KEYBOARD_LL` 低级钩子（未在真机验证，仅 `cargo check` 通过）
 
+## 边说边出字（真流式）
+
+`streaming = true`（默认）且模型是 WebSocket 系时，按住热键说话，字会**实时**出现：
+托盘提示和终端视图顶部都有流式字幕，松开后直接交付，不用再等整段转写。
+
+- 实现上音频按 100 ms 帧上送（16 kHz PCM），`intermediate_result` 打开，已定稿句子 + 当前半句拼着显示
+- 流式失败（断网、超时、服务端报错）自动回退到「录完整段再批量转写」——采集线程本来就留了整段样本，一个字不丢
+- `dictate settings` 里有开关；批量模型（`qwen3-asr-flash` 等）此项不生效
+
 ## 终端界面
 
 扁平布局，底部一行输入（和 grok-cli 一样，不背快捷键）：直接打字实时过滤历史；
@@ -103,6 +112,7 @@ dictate doctor       # 不录音，验 key / 区域 / 模型 / 粘贴能力 / �
 `F1` 帮助 · `F2` 设置 · `F10`/`Esc`/`Ctrl+C` 退出视图 ·
 `Ctrl+R` 刷新 · `Ctrl+L` 清空历史 · `Ctrl+Q` 退守护进程。
 
+录音中列表顶部有流式字幕（边说边出字，见上文）；
 顶栏第二行常驻显示守护进程最近一次结果（完成/失败），命令反馈以 toast 形式显示几秒后消失；
 失败时红字后面直接跟「下一步怎么办」（换 key / 换区域 / 查麦克风电平 / 跑 doctor）。
 
@@ -112,7 +122,7 @@ dictate doctor       # 不录音，验 key / 区域 / 模型 / 粘贴能力 / �
 |---|---|---|
 | `qwen3-asr-flash` | OpenAI 兼容 | `{base}/compatible-mode/v1/chat/completions` |
 | `qwen-audio-3.1-asr-flash` · `qwen-audio-3.0-asr-flash` | DashScope 同步 | `{base}/api/v1/services/aigc/multimodal-generation/generation` |
-| `qwen-audio-3.1-asr-flash-message` · `-streaming` · `qwen3-asr-flash-realtime` | WebSocket | `wss://{host}/api-ws/v1/inference` |
+| `qwen-audio-3.1-asr-flash-message` · `-streaming` · `qwen3-asr-flash-realtime` | WebSocket | `wss://{host}/api-ws/v1/inference`，支持边说边出字 |
 | `*-filetrans` | — | 只支持异步任务接口，**没实现**（选到会直接报错说明） |
 
 形状由模型名自动决定；`api_style` 可强制。
@@ -139,7 +149,7 @@ src/
 ## 开发
 
 ```bash
-cargo test            # 72 条：AGC/VAD/重采样/WAV、三种报文形状真 socket 端到端、命令/参数面板、标记复制、离屏渲染快照、历史 CRUD
+cargo test            # 76 条：AGC/VAD/重采样/WAV、三种报文形状真 socket 端到端、命令/参数面板、标记复制、流式会话端到端、离屏渲染快照、历史 CRUD
 cargo clippy --all-targets
 cargo fmt
 ```
