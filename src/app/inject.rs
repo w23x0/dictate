@@ -2,7 +2,10 @@
 //!
 //! 策略（由强到弱，和原版 LazyTyper 一致：剪贴板 + 模拟粘贴键，失败再退化为只复制）：
 //! 1. 存一份原剪贴板 → 写入新文本
-//! 2. 模拟粘贴快捷键：Wayland 优先 `wtype`/`ydotool`，X11 用 `xdotool`
+//! 2. 模拟粘贴快捷键：Wayland 优先 `ydotool`（uinput）→ `wtype`，X11 用 `xdotool`。
+//!    Wayland 下默认**不**用 `xdotool`：它只能打给 XWayland 窗口，却会让 Xwayland
+//!    去申请 RemoteDesktop portal，GNOME 每次都会弹「Allow Remote Interaction」授权框。
+//!    需要时用 `DICTATE_XDOTOOL=1` 显式打开。
 //! 3. 确认自动粘贴成功后，400 ms 把原剪贴板还回去（不污染用户的剪贴板）；
 //!    没粘上（或 clipboard 模式）时保留新文本——用户还要手动 Ctrl+V，不能盖回去
 //! 4. 一个都不可用时只留剪贴板，并明确告诉用户“按 Ctrl+V”
@@ -75,7 +78,8 @@ pub fn deliver(text: &str, mode: Mode) -> Result<String> {
             }
             None => {
                 how = if wayland {
-                    "已复制到剪贴板；Wayland 下自动粘贴需要 wtype 或 ydotool，当前都没有——按 Ctrl+V"
+                    "已复制到剪贴板；Wayland 下自动粘贴需要 ydotool（推荐，apt install ydotool 后 \
+                     systemctl --user enable --now ydotool）或 wtype——按 Ctrl+V 也可以"
                         .into()
                 } else {
                     "已复制到剪贴板；没找到 xdotool，按 Ctrl+V".into()
@@ -160,26 +164,39 @@ fn write_clipboard(text: &str) -> bool {
     false
 }
 
+/// Wayland 下才允许 `xdotool`（默认关）：它会触发 Xwayland 的 RemoteDesktop 授权框。
+const PASTE_XDOTOOL_ENV: &str = "DICTATE_XDOTOOL";
+
+const XDOTOOL: (&str, &[&str]) = ("xdotool", &["key", "--clearmodifiers", "ctrl+v"]);
+const YDOTOOL: (&str, &[&str]) = ("ydotool", &["key", "29:1", "47:1", "47:0", "29:0"]);
+const WTYPE: (&str, &[&str]) = ("wtype", &["-M", "ctrl", "v", "-m", "ctrl"]);
+
+/// 按优先级列出要尝试的粘贴工具。
+///
+/// Wayland：`ydotool`（uinput，直连内核，不经 portal）→ `wtype`（需要合成器支持
+/// virtual-keyboard 协议，GNOME 不支持）→ `xdotool`（仅当显式开启：它是 X11 客户端，
+/// 打不进原生 Wayland 窗口，还会让 Xwayland 申请 RemoteDesktop 权限并弹系统授权框）。
+fn attempts(wayland: bool, allow_xdotool: bool) -> Vec<(&'static str, &'static [&'static str])> {
+    if wayland {
+        let mut list = vec![YDOTOOL, WTYPE];
+        if allow_xdotool {
+            list.push(XDOTOOL);
+        }
+        list
+    } else {
+        vec![XDOTOOL, YDOTOOL, WTYPE]
+    }
+}
+
 /// 返回用了哪个工具；都不可用返回 None。
 fn send_paste(wayland: bool) -> Option<&'static str> {
-    let attempts: &[(&str, &[&str])] = if wayland {
-        &[
-            ("wtype", &["-M", "ctrl", "v", "-m", "ctrl"]),
-            ("ydotool", &["key", "29:1", "47:1", "47:0", "29:0"]),
-            ("xdotool", &["key", "--clearmodifiers", "ctrl+v"]),
-        ]
-    } else {
-        &[
-            ("xdotool", &["key", "--clearmodifiers", "ctrl+v"]),
-            ("wtype", &["-M", "ctrl", "v", "-m", "ctrl"]),
-        ]
-    };
+    let attempts = attempts(wayland, std::env::var_os(PASTE_XDOTOOL_ENV).is_some());
     for (tool, args) in attempts {
         if !which(tool) {
             continue;
         }
         if let Ok(status) = Command::new(tool)
-            .args(*args)
+            .args(args)
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status()
@@ -222,5 +239,23 @@ mod tests {
     #[test]
     fn empty_text_is_rejected() {
         assert!(deliver("   ", Mode::Auto).is_err());
+    }
+
+    #[test]
+    fn wayland_paste_prefers_ydotool_and_skips_xdotool() {
+        let tools: Vec<&str> = attempts(true, false).iter().map(|(t, _)| *t).collect();
+        assert_eq!(tools, ["ydotool", "wtype"]);
+    }
+
+    #[test]
+    fn wayland_xdotool_needs_explicit_opt_in() {
+        let tools: Vec<&str> = attempts(true, true).iter().map(|(t, _)| *t).collect();
+        assert_eq!(tools, ["ydotool", "wtype", "xdotool"]);
+    }
+
+    #[test]
+    fn x11_paste_starts_with_xdotool() {
+        let tools: Vec<&str> = attempts(false, false).iter().map(|(t, _)| *t).collect();
+        assert_eq!(tools[0], "xdotool");
     }
 }
