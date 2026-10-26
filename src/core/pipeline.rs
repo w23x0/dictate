@@ -49,7 +49,9 @@ pub fn prepare_wav(cfg: &Config, pcm: &[f32], rate: u32) -> Result<Vec<u8>> {
             .parent()
             .map(|d| d.join("last.wav"))
             .unwrap_or_else(|| std::env::temp_dir().join("last.wav"));
-        audio::write_wav(&keep, &voiced).ok();
+        if let Err(e) = audio::write_wav(&keep, &voiced) {
+            eprintln!("[history] last.wav 没写成功（/retry 将不可用）：{e:#}");
+        }
     }
     Ok(audio::wav_bytes(&voiced))
 }
@@ -79,6 +81,7 @@ pub fn transcribe_and_record(
         Ok(t) => Entry {
             id: new_id(),
             ts: now_rfc3339(),
+            ts_ms: crate::core::history::now_ms(),
             duration_ms: (duration_secs * 1000.0) as u64,
             latency_ms: t.latency_ms,
             model: cfg.model.clone(),
@@ -86,16 +89,18 @@ pub fn transcribe_and_record(
             text: t.text.clone(),
         },
         Err(e) => {
-            hist.append(&Entry {
+            if let Err(ae) = hist.append(&Entry {
                 id: new_id(),
                 ts: now_rfc3339(),
+                ts_ms: crate::core::history::now_ms(),
                 duration_ms: (duration_secs * 1000.0) as u64,
                 latency_ms: 0,
                 model: cfg.model.clone(),
                 status: format!("error: {e:#}"),
                 text: String::new(),
-            })
-            .ok();
+            }) {
+                eprintln!("[history] 失败条目没写进历史：{ae:#}");
+            }
             return Err(e);
         }
     };

@@ -51,7 +51,7 @@ pub(crate) const BASES: &[(&str, &str)] = &[
     ("https://dashscope-intl.aliyuncs.com", "新加坡"),
 ];
 
-const FIELDS: [&str; 14] = [
+const FIELDS: [&str; 15] = [
     "服务地址",
     "模型",
     "报文形状",
@@ -66,6 +66,7 @@ const FIELDS: [&str; 14] = [
     "配色 (auto/dark/light)",
     "交付方式",
     "流式转写（边说边出字）",
+    "保留音频（last.wav，可 /retry）",
 ];
 
 pub struct Form {
@@ -155,6 +156,13 @@ impl Form {
                     "关".into()
                 }
             }
+            14 => {
+                if self.cfg.keep_audio {
+                    "开（失败后可 /retry 重转）".into()
+                } else {
+                    "关".into()
+                }
+            }
             _ => String::new(),
         }
     }
@@ -181,6 +189,16 @@ impl Form {
         let i = self.sel;
         if i == 5 {
             self.cfg.enable_itn = !self.cfg.enable_itn;
+            self.dirty = true;
+            return;
+        }
+        if i == 2 {
+            // 报文形状由模型名决定，是只读展示：进编辑态只会造成「看似能改」的假象
+            self.status = "报文形状由模型决定——改「模型」这一项即可".into();
+            return;
+        }
+        if i == 14 {
+            self.cfg.keep_audio = !self.cfg.keep_audio;
             self.dirty = true;
             return;
         }
@@ -316,7 +334,7 @@ impl Form {
             Ok(()) => {
                 self.dirty = true;
                 self.editing = false;
-                self.status = "已修改（按 s 保存）".into();
+                self.status = "已修改（自动保存）".into();
             }
             Err(e) => self.status = format!("没改：{e:#}"),
         }
@@ -437,26 +455,21 @@ fn event_loop(term: &mut Terminal<CrosstermBackend<std::io::Stdout>>, f: &mut Fo
         if k.kind != KeyEventKind::Press {
             continue;
         }
-        if key(f, &k)? {
+        if handle_form_key(f, &k)? {
             return Ok(());
         }
     }
 }
 
 /// 按键处理。true = 关闭设置页。
+/// 任何路径（包括关闭）都会先把未保存的改动落盘——不存在「已确认的修改静默丢失」的出口。
 fn key(f: &mut Form, k: &crossterm::event::KeyEvent) -> Result<bool> {
-    if !f
-        .test
-        .as_ref()
-        .map(|rx| rx.try_recv().is_ok())
-        .unwrap_or(false)
-    {
-        // 测试结果在 event_loop 里收取；内嵌模式由 tui 侧收
-    }
-    if f.picker.is_some() && k.code == KeyCode::Char('q') {
-        return Ok(true);
-    }
     if let Some(p) = f.picker.as_mut() {
+        // q 只关选择器，不关整个设置页（j/k 导航和 q 同键区，误触不该把人踢出去）
+        if k.code == KeyCode::Char('q') && k.modifiers.is_empty() {
+            f.picker = None;
+            return Ok(false);
+        }
         match k.code {
             KeyCode::Esc => f.picker = None,
             KeyCode::Up | KeyCode::Char('k') => p.sel = p.sel.saturating_sub(1),
@@ -476,7 +489,7 @@ fn key(f: &mut Form, k: &crossterm::event::KeyEvent) -> Result<bool> {
                 }
                 f.dirty = true;
                 f.picker = None;
-                f.status = format!("已选择 {chosen}（F2 保存）");
+                f.status = format!("已选择 {chosen}");
             }
             _ => {}
         }
@@ -511,17 +524,16 @@ fn key(f: &mut Form, k: &crossterm::event::KeyEvent) -> Result<bool> {
         KeyCode::Enter => f.start_edit(),
         KeyCode::Left if f.sel == 11 => f.cycle_theme(-1),
         KeyCode::Right if f.sel == 11 => f.cycle_theme(1),
-        KeyCode::F(2) => f.save()?,
-        KeyCode::Char('s') if k.modifiers.contains(KeyModifiers::CONTROL) => f.save()?,
+        KeyCode::F(2) | KeyCode::Char('s')
+            if k.modifiers.is_empty() || k.modifiers.contains(KeyModifiers::CONTROL) =>
+        {
+            match f.save() {
+                Ok(()) => {}
+                Err(e) => f.status = format!("保存失败：{e:#}"),
+            }
+        }
         KeyCode::F(3) => f.run_test(),
         _ => {}
-    }
-    // 改完立刻落盘：不要求用户记得按保存键
-    if f.dirty {
-        match f.save_silent() {
-            Ok(()) => {}
-            Err(e) => f.status = format!("保存失败：{e:#}"),
-        }
     }
     Ok(false)
 }
@@ -532,8 +544,17 @@ pub fn draw_form(fr: &mut ratatui::Frame, f: &Form) {
 }
 
 /// 处理一个按键。返回 true = 关闭设置页。
+/// 收尾自动保存在这里做：key() 内部不管从哪条路径提前 return（picker 回车、编辑态、
+/// Esc 关页），改动都会先落盘，不存在「已确认的修改静默丢失」的出口。
 pub fn handle_form_key(f: &mut Form, k: &crossterm::event::KeyEvent) -> Result<bool> {
-    key(f, k)
+    let close = key(f, k)?;
+    if f.dirty {
+        match f.save_silent() {
+            Ok(()) => {}
+            Err(e) => f.status = format!("保存失败：{e:#}"),
+        }
+    }
+    Ok(close)
 }
 
 fn draw(fr: &mut ratatui::Frame, f: &Form) {
@@ -716,7 +737,7 @@ fn draw(fr: &mut ratatui::Frame, f: &Form) {
     };
     fr.render_widget(
         Paragraph::new(Line::from(Span::styled(
-            "↑↓ 选择   ⏎ 修改/选择   F2 保存   F3 测试   Esc 退出",
+            "↑↓ 选择   ⏎ 修改/选择   F2 或 s 保存   F3 测试   Esc 退出",
             Style::default().fg(th.faint),
         )))
         .alignment(ratatui::layout::Alignment::Right)
@@ -766,5 +787,37 @@ mod tests {
             f.status
         );
         assert_eq!(f.cfg.silence_stop_ms, 1500);
+    }
+
+    fn press(c: KeyCode, m: KeyModifiers) -> crossterm::event::KeyEvent {
+        crossterm::event::KeyEvent::new(c, m)
+    }
+
+    #[test]
+    fn keep_audio_is_toggleable_here() {
+        // /retry 依赖 keep_audio，以前设置页里没有这个字段、全 UI 无开关
+        let mut f = Form::new(Config::default());
+        assert!(!f.cfg.keep_audio);
+        f.sel = 14;
+        key(&mut f, &press(KeyCode::Enter, KeyModifiers::NONE)).unwrap();
+        assert!(f.cfg.keep_audio && f.dirty, "回车应切换并置 dirty");
+    }
+
+    #[test]
+    fn picker_q_closes_picker_not_the_page() {
+        let mut f = Form::new(Config::default());
+        f.open_model_picker();
+        let close = key(&mut f, &press(KeyCode::Char('q'), KeyModifiers::NONE)).unwrap();
+        assert!(!close, "q 只关选择器，不该关掉整个设置页");
+        assert!(f.picker.is_none());
+    }
+
+    #[test]
+    fn readonly_shape_field_refuses_editing() {
+        let mut f = Form::new(Config::default());
+        f.sel = 2;
+        key(&mut f, &press(KeyCode::Enter, KeyModifiers::NONE)).unwrap();
+        assert!(!f.editing && !f.dirty, "报文形状只读，不该进编辑态");
+        assert!(f.status.contains("由模型决定"));
     }
 }

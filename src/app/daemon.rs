@@ -11,7 +11,7 @@ use anyhow::Result;
 
 use crate::audio::Capture;
 use crate::core::config::Config;
-use crate::core::history::{new_id, now_rfc3339, Entry, History};
+use crate::core::history::{new_id, now_ms, now_rfc3339, Entry, History};
 use crate::hotkey::{self, HotkeyEvent};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -68,9 +68,15 @@ pub struct Daemon {
     started: Option<Instant>,
     pub quit: bool,
     pub last_error: Option<String>,
+    /// 非失败的信息（按键太短、流式回退批量等）：显示为暗色提示，不红、不带"下一步"建议
+    pub last_note: Option<String>,
     /// 最近一次交付方式（托盘提示用）
     pub paste_note: Option<String>,
     pub last_text: Option<String>,
+    /// 上次状态文件实际落盘时间（心跳节流用）
+    last_publish: Instant,
+    /// 上次落盘的状态内容（去掉心跳字段），变了才写
+    published_key: String,
 }
 
 impl Daemon {
@@ -97,23 +103,37 @@ impl Daemon {
             started: None,
             quit: false,
             last_error: None,
+            last_note: None,
             paste_note: None,
             last_text: None,
+            last_publish: Instant::now(),
+            published_key: String::new(),
         })
     }
 
     /// 把状态写进 `status.json`，供 `dictate run` 的终端视图读取。
+    /// `hb_ms` 心跳随内容变化或每 3 秒刷新一次——终端视图靠它发现守护进程崩溃后的冻结状态。
     fn publish(&mut self) {
         let (phase, since) = match self.phase {
             Phase::Idle => ("idle", 0),
-            Phase::Recording(t) => ("recording", now_ms(t)),
-            Phase::Transcribing(t) => ("transcribing", now_ms(t)),
+            Phase::Recording(t) => ("recording", now_ms_of(t)),
+            Phase::Transcribing(t) => ("transcribing", now_ms_of(t)),
         };
+        let key = format!(
+            "{phase}|{since}|{:?}|{:?}|{:?}|{:?}",
+            self.last_text, self.last_error, self.last_note, self.partial
+        );
+        let fresh = self.last_publish.elapsed() < Duration::from_secs(3);
+        if key == self.published_key && fresh {
+            return;
+        }
         let v = serde_json::json!({
             "phase": phase,
             "since_ms": since,
+            "hb_ms": now_ms(),
             "text": self.last_text,
             "error": self.last_error,
+            "note": self.last_note,
             "partial": if matches!(self.phase, Phase::Recording(_)) {
                 self.partial.clone()
             } else {
@@ -121,17 +141,15 @@ impl Daemon {
             },
         });
         let body = v.to_string();
-        if body == self.published {
-            return;
-        }
         let path = crate::core::config::status_path();
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir).ok();
         }
         let tmp = path.with_extension("json.tmp");
-        if std::fs::write(&tmp, &body).is_ok() {
-            std::fs::rename(&tmp, &path).ok();
+        if std::fs::write(&tmp, &body).is_ok() && std::fs::rename(&tmp, &path).is_ok() {
             self.published = body;
+            self.published_key = key;
+            self.last_publish = Instant::now();
         }
     }
 
@@ -172,6 +190,7 @@ impl Daemon {
                 self.started = Some(Instant::now());
                 self.phase = Phase::Recording(Instant::now());
                 self.last_error = None;
+                self.last_note = None;
                 self.partial = None;
                 self.stream_dead = false;
                 self.awaiting = if streamed {
@@ -227,7 +246,7 @@ impl Daemon {
     /// 重转上一次送服务端的音频（`keep_audio` 留的 last.wav）。
     fn retry(&mut self) {
         if !matches!(self.phase, Phase::Idle) {
-            self.last_error = Some("正在录音/转写，等它结束再重试".into());
+            self.last_note = Some("正在录音/转写，等它结束再重试".into());
             return;
         }
         let path = crate::core::config::status_path()
@@ -268,11 +287,13 @@ impl Daemon {
         if !matches!(self.phase, Phase::Recording(_)) {
             return;
         }
-        // 误触：按一下就松（< 200 ms）直接丢弃，免得每次点错都产生一条空记录
+        // 误触：按一下就松（< 200 ms）直接丢弃，免得每次点错都产生一条空记录。
+        // 这是正常防抖，不是转写失败——走 note 通道，别在界面渲染成红字失败
         let elapsed = self.started.map(|t| t.elapsed()).unwrap_or_default();
         if elapsed < Duration::from_millis(200) {
             self.cancel();
-            self.last_error = Some("按键太短，已忽略".into());
+            self.last_error = None;
+            self.last_note = Some("按键太短，已忽略".into());
             return;
         }
         self.started = None;
@@ -322,29 +343,40 @@ impl Daemon {
 
     fn finish_ok(&mut self, dt: DoneText, secs: f32) {
         self.awaiting = Awaiting::None;
+        self.started = None;
         let hist = History::new(crate::core::config::history_path());
-        hist.append(&Entry {
-            id: new_id(),
-            ts: now_rfc3339(),
-            duration_ms: (secs * 1000.0) as u64,
-            latency_ms: dt.latency_ms,
-            model: self.cfg.model.clone(),
-            status: "ok".into(),
-            text: dt.text.clone(),
-        })
-        .ok();
+        let mut append_err = None;
+        if let Err(e) = hist.append_with_cap(
+            &Entry {
+                id: new_id(),
+                ts: now_rfc3339(),
+                ts_ms: now_ms(),
+                duration_ms: (secs * 1000.0) as u64,
+                latency_ms: dt.latency_ms,
+                model: self.cfg.model.clone(),
+                status: "ok".into(),
+                text: dt.text.clone(),
+            },
+            self.cfg.keep_entries,
+        ) {
+            append_err = Some(format!("历史写入失败：{e:#}"));
+        }
         // 识别完直接送到当前焦点窗口（剪贴板 + 模拟粘贴）
         let mode = crate::app::inject::Mode::parse(&self.cfg.paste);
         match crate::app::inject::deliver(&dt.text, mode) {
             Ok(how) => {
                 self.last_text = Some(dt.text);
                 self.paste_note = Some(how);
-                self.last_error = None;
+                self.last_error = append_err;
             }
             Err(e) => {
                 self.last_text = Some(dt.text);
                 self.paste_note = None;
-                self.last_error = Some(format!("交付失败：{e}"));
+                let msg = format!("交付失败：{e}");
+                self.last_error = Some(match append_err {
+                    Some(ae) => format!("{msg}（{ae}）"),
+                    None => msg,
+                });
             }
         }
         self.phase = Phase::Idle;
@@ -354,17 +386,23 @@ impl Daemon {
     fn finish_err(&mut self, e: String, secs: f32) {
         // 失败也写一条错误历史（沿用原行为），返回值仍然是错误
         let hist = History::new(crate::core::config::history_path());
-        hist.append(&Entry {
-            id: new_id(),
-            ts: now_rfc3339(),
-            duration_ms: (secs * 1000.0) as u64,
-            latency_ms: 0,
-            model: self.cfg.model.clone(),
-            status: format!("error: {e}"),
-            text: String::new(),
-        })
-        .ok();
+        if let Err(ae) = hist.append_with_cap(
+            &Entry {
+                id: new_id(),
+                ts: now_rfc3339(),
+                ts_ms: now_ms(),
+                duration_ms: (secs * 1000.0) as u64,
+                latency_ms: 0,
+                model: self.cfg.model.clone(),
+                status: format!("error: {e}"),
+                text: String::new(),
+            },
+            self.cfg.keep_entries,
+        ) {
+            eprintln!("[history] 失败条目没写进历史：{ae:#}");
+        }
         self.awaiting = Awaiting::None;
+        self.started = None;
         self.last_error = Some(e);
         self.phase = Phase::Idle;
         self.partial = None;
@@ -427,7 +465,17 @@ impl Daemon {
             }
         }
 
-        // 流式卡死兜底：超时还等不到 Final，就带着整段样本回退批量
+        // 录音到 max_seconds 时采集线程会自己停（整段样本落进结果通道，流式会话也随之收尾）。
+        // 守护进程在这里主动收尾，不等用户松手——否则相位虚挂在「录音中」计时虚涨，
+        // 样本滞留结果通道，下一次录音 stop() 按 FIFO 会先取到这段旧音频
+        if let Phase::Recording(t) = self.phase {
+            if t.elapsed() >= Duration::from_secs_f32(self.cfg.max_seconds + 0.5) {
+                self.stop();
+            }
+        }
+
+        // 流式卡死兜底：超时还等不到 Final，就带着整段样本回退批量。
+        // 这是「恢复中」不是失败——走 note 通道，别在界面渲染成红字
         if let Phase::Transcribing(t) = self.phase {
             let budget = Duration::from_secs(self.cfg.timeout_secs.max(30) + 10);
             if t.elapsed() > budget {
@@ -435,7 +483,7 @@ impl Daemon {
                     pcm: Some((rate, pcm, secs)),
                 } = std::mem::replace(&mut self.awaiting, Awaiting::None)
                 {
-                    self.last_error = Some("流式超时，回退批量转写".into());
+                    self.last_note = Some("流式超时，回退批量转写".into());
                     self.spawn_batch(rate, pcm, secs);
                 }
             }
@@ -449,9 +497,24 @@ impl Daemon {
                     match prev {
                         // 已取消/过期，丢弃
                         Awaiting::None => {}
-                        // 还在录音阶段就出 Final：只可能是失败——标记后等松开走批量
+                        // 还在录音阶段就出 Final：只可能是采集侧先结束了——
+                        // max_seconds 自停（样本已先落进结果通道）或采集流挂掉
                         Awaiting::Stream { pcm: None } => match res {
-                            Ok(dt) => self.finish_ok(dt, 0.0),
+                            Ok(dt) => {
+                                // 立即取走整段样本按真实时长落库交付；取不到就用已录时长近似。
+                                // 绝不能按 0 秒落库（污染按天统计），也不能让样本滞留到下一次录音
+                                let secs = match self.capture.try_take() {
+                                    Some((rate, pcm)) if !pcm.is_empty() => {
+                                        pcm.len() as f32 / rate as f32
+                                    }
+                                    _ => self
+                                        .started
+                                        .map(|t| t.elapsed().as_secs_f32())
+                                        .unwrap_or(0.0),
+                                };
+                                self.finish_ok(dt, secs);
+                            }
+                            // 会话挂了：标记后等松开/自动收尾，拿整段样本走批量
                             Err(_) => self.stream_dead = true,
                         },
                         Awaiting::Stream {
@@ -472,14 +535,15 @@ impl Daemon {
 
         self.publish();
         match self.phase {
-            Phase::Idle => match (&self.last_error, &self.last_text) {
-                (Some(e), _) => format!("dictate — 失败：{}", truncate(e, 60)),
-                (None, Some(t)) => format!(
+            Phase::Idle => match (&self.last_error, &self.last_note, &self.last_text) {
+                (Some(e), _, _) => format!("dictate — 失败：{}", truncate(e, 60)),
+                (None, Some(n), _) => format!("dictate — {}", truncate(n, 60)),
+                (None, None, Some(t)) => format!(
                     "dictate — {}（{}）",
                     truncate(t, 50),
                     self.paste_note.as_deref().unwrap_or("已识别")
                 ),
-                (None, None) => "dictate — 就绪".to_string(),
+                (None, None, None) => "dictate — 就绪".to_string(),
             },
             Phase::Recording(t) => match self.partial.as_deref() {
                 Some(p) if !p.is_empty() => format!(
@@ -496,7 +560,7 @@ impl Daemon {
     }
 }
 
-fn now_ms(t: Instant) -> u64 {
+fn now_ms_of(t: Instant) -> u64 {
     let elapsed = t.elapsed().as_millis() as u64;
     (std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

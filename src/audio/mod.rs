@@ -392,6 +392,12 @@ impl Capture {
             .recv_timeout(std::time::Duration::from_secs(5))
             .map_err(|_| anyhow!("采集线程没有在 5 秒内交回样本"))
     }
+
+    /// 非阻塞取一次样本：采集线程到 `max_seconds` 自停时样本会先落进结果通道，
+    /// 守护进程在「流式先出结果」的竞态窗口里用它把样本及时取走，避免滞留到下一次录音。
+    pub fn try_take(&self) -> Option<(u32, Vec<f32>)> {
+        self.result.try_recv().ok()
+    }
 }
 
 impl Drop for Capture {

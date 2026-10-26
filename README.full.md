@@ -44,11 +44,19 @@ dictate doctor       # 不录音，验 key / 区域 / 模型 / 粘贴能力 / �
 
 | 值 | 行为 |
 |---|---|
-| `auto`（默认） | 存原剪贴板 → 写入文本 → 模拟粘贴键（`wtype`/`ydotool`/`xdotool` 中有哪个用哪个）→ **粘贴成功后** 400 ms 还原剪贴板 |
+| `auto`（默认） | 存原剪贴板 → 写入文本 → 模拟粘贴键（Wayland：`ydotool` → `wtype`；X11：`xdotool` 优先）→ **粘贴成功后** 400 ms 还原剪贴板 |
 | `clipboard` | 只写剪贴板，不按键（文本会留在剪贴板里等你手动粘贴） |
 | `off` | 只进历史 |
 
-没粘上（比如 Wayland 下没有 `wtype`/`ydotool`）时同样保留新文本，状态里会说明，按 `Ctrl+V` 即可。
+没粘上（比如 Wayland 下没有 `ydotool`/`wtype`）时同样保留新文本，状态里会说明，按 `Ctrl+V` 即可。
+
+Wayland 下的按键注入：
+
+| 工具 | 说明 |
+|---|---|
+| `ydotool` | **推荐**：走 `/dev/uinput`，不经过任何 portal。装好后 `systemctl --user enable --now ydotool` |
+| `wtype` | 需要合成器支持 virtual-keyboard 协议；**GNOME/mutter 不支持**，装了也会失败 |
+| `xdotool` | 是 X11 客户端，打不进原生 Wayland 窗口，而且会让 Xwayland 去申请 RemoteDesktop portal——GNOME 会反复弹「Allow Remote Interaction」授权框。Wayland 下默认不用，需要时设 `DICTATE_XDOTOOL=1` |
 `dictate doctor` 会列出当前机器上有哪些工具；`dictate inject-test "文字"` 可以单独验证这条链路。
 
 ## 热键
@@ -76,7 +84,8 @@ dictate doctor       # 不录音，验 key / 区域 / 模型 / 粘贴能力 / �
 
 ## 终端界面
 
-扁平布局，底部一行输入（和 grok-cli 一样，不背快捷键）：直接打字实时过滤历史；
+扁平布局，底部一行输入（和 grok-cli 一样，不背快捷键也能用完所有功能；快捷键是可选加速）：
+直接打字实时过滤历史；
 `/` 弹出 opencode 式命令面板——模糊过滤、命中字符高亮、`↑↓` 选、`⏎` 执行、`Tab` 补全。
 
 ```
@@ -99,17 +108,18 @@ dictate doctor       # 不录音，验 key / 区域 / 模型 / 粘贴能力 / �
 
 | 命令 | 作用 |
 |---|---|
-| `/settings` | 设置页（`Esc` 返回，改完自动保存） |
+| `/settings` | 设置页（`Esc` 返回，改完自动保存，含「保留音频」开关） |
 | `/model` `/base` | 敲个空格后面板里选；直接带参数 = 原样设置 |
 | `/key sk-…`（输入行自动打码）· `/hotkey ctrl+space` · `/mode hold\|toggle` | 改了立即写配置 |
+| `/theme auto\|dark\|light` | 配色（不带参数则循环切换，立即生效） |
 | `/record` | 手动开关录音 |
-| `/retry` | 重转上一次的音频（需 `keep_audio = true`；托盘菜单也有） |
-| `/search 文字` | 过滤历史（直接打字也实时过滤） |
+| `/retry` | 重转上一次的音频（需先在设置里打开「保留音频」；托盘菜单也有） |
+| `/search 文字` | 过滤历史（直接打字也实时过滤，错误信息也参与匹配） |
 | `/clear` · `/daemon stop` | 清空历史 / 退守护进程（回车确认） |
-| `/help` · `/quit` | 帮助 / 退出视图 |
+| `/refresh` · `/help` · `/quit` | 重读历史文件 / 帮助 / 退出视图 |
 
 复制走 OSC 52（SSH 里也落到本地剪贴板；tmux 里自动套 passthrough，需 `allow-passthrough on`）。
-键：`↑↓`/`j k` 选择 · `g` 最新 `G` 最旧 · `Ctrl+D/U` 翻半页 · `m` 标记多条 ·
+键：`↑↓`/`j k` 选择 · `g` 最新 `G` 最旧 · `Ctrl+D/U` 快速跳 12 条 · `m` 标记多条 ·
 `⏎` 复制选中（有标记则整批复制，OSC 52）· `Del` 删除 · `空格` 手动录音 ·
 `F1` 帮助 · `F2` 设置 · `F10`/`Esc`/`Ctrl+C` 退出视图 ·
 `Ctrl+R` 刷新 · `Ctrl+L` 清空历史 · `Ctrl+Q` 退守护进程。
@@ -151,7 +161,7 @@ src/
 ## 开发
 
 ```bash
-cargo test            # 77 条：AGC/VAD/重采样/WAV、三种报文形状真 socket 端到端、命令/参数面板、标记复制、流式会话端到端、离屏渲染快照、历史 CRUD
+cargo test            # 单元 + 端到端：AGC/VAD/重采样/WAV、三种报文形状真 socket 端到端、命令/参数面板、标记复制、流式会话端到端、离屏渲染快照、历史 CRUD 与排序
 cargo clippy --all-targets
 cargo fmt
 ```

@@ -41,6 +41,8 @@ pub struct Config {
     pub input_device: Option<String>,
     /// 把每次送到服务端的 WAV 留一份到 `~/.local/share/dictate/last.wav`。
     pub keep_audio: bool,
+    /// 历史最多留多少条，0 = 不限。超出后裁掉最旧的（带 10% 滞回，不每次追加都重写）。
+    pub keep_entries: usize,
     /// 转写完成后怎么交付：`auto`（剪贴板 + 模拟粘贴）/ `clipboard` / `off`。
     pub paste: String,
     /// 真流式（边说边出字）：WebSocket 系模型才有用；失败自动回退批量。
@@ -66,6 +68,7 @@ impl Default for Config {
             color: None,
             input_device: None,
             keep_audio: false,
+            keep_entries: 0,
             paste: "auto".into(),
             streaming: true,
         }

@@ -31,6 +31,8 @@ use crate::ui::theme::Theme;
 const FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 /// 列表项前缀 "▌ 22:37  ❯ " 的显示宽度，折行的续行按它缩进。
 const LIST_PREFIX: usize = 11;
+/// 守护进程心跳超过这个毫秒数没有刷新，就当它死了（状态文件还留着 = 崩溃残留）。
+const DAEMON_STALE_MS: u64 = 6_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Phase {
@@ -55,6 +57,8 @@ struct App {
     selected: usize,
     /// 守护进程状态文件里带出来的持久提示（完成/失败/没在跑），显示在第二行
     daemon_note: String,
+    /// 心跳新鲜——false 时录音/转写命令直接拒绝，不装作「已开始」
+    daemon_alive: bool,
     /// 流式中间文本（录音中实时刷新）
     partial: String,
     phase: Phase,
@@ -72,6 +76,13 @@ struct App {
     marks: std::collections::HashSet<String>,
     toast: Option<Toast>,
     quit_requested: bool,
+    // ── 列表渲染缓存：条目文本折行按 (id, 宽度) 记住，列表项只在签名变化时重建，
+    //    100 ms 一帧不再对全部历史做 O(n) 的宽度计算与分配
+    wrap_cache: std::collections::HashMap<(String, usize), Vec<String>>,
+    list_items: Vec<ListItem<'static>>,
+    list_first_of: Vec<usize>,
+    list_sig: String,
+    list_at: Instant,
 }
 
 /// 斜杠命令：名字、参数提示、说明
@@ -80,10 +91,11 @@ const COMMANDS: &[(&str, &str, &str)] = &[
     ("/model", "[名字]", "切换模型（不带参数则列表选）"),
     ("/base", "[url]", "切换服务地址（不带参数则列表选）"),
     ("/key", "[sk-…]", "设置 API key"),
+    ("/theme", "[auto|dark|light]", "配色（不带参数则循环切换）"),
     ("/hotkey", "[组合键]", "设置热键，如 ctrl+space"),
     ("/mode", "hold|toggle", "热键语义：按住说话 / 按一下开关"),
     ("/record", "", "手动开始或停止录音"),
-    ("/retry", "", "重转上一次的音频（需 keep_audio）"),
+    ("/retry", "", "重转上一次的音频（设置里开「保留音频」）"),
     ("/search", "[文字]", "按内容过滤历史"),
     ("/clear", "", "清空全部历史（需确认）"),
     ("/refresh", "", "重新读历史文件"),
@@ -110,6 +122,7 @@ impl App {
             query: String::new(),
             selected: 0,
             daemon_note: String::new(),
+            daemon_alive: false,
             partial: String::new(),
             phase: Phase::Idle,
             subtitle: String::new(),
@@ -121,6 +134,11 @@ impl App {
             marks: std::collections::HashSet::new(),
             toast: None,
             quit_requested: false,
+            wrap_cache: std::collections::HashMap::new(),
+            list_items: Vec::new(),
+            list_first_of: Vec::new(),
+            list_sig: String::new(),
+            list_at: Instant::now(),
         };
         app.reload();
         app
@@ -133,13 +151,19 @@ impl App {
 
     fn refilter(&mut self) {
         let q = self.query.to_lowercase();
-        // 倒序：**最新的一条在最上面**，选中项默认就是它
+        // 倒序：**最新的一条在最上面**，选中项默认就是它。
+        // 过滤同时看 text 与 status——错误条目 text 为空，只匹配 text 会把
+        // 刚发生的失败从筛选视图里藏掉
         self.shown = self
             .all
             .iter()
             .enumerate()
             .rev()
-            .filter(|(_, e)| q.is_empty() || e.text.to_lowercase().contains(&q))
+            .filter(|(_, e)| {
+                q.is_empty()
+                    || e.text.to_lowercase().contains(&q)
+                    || e.status.to_lowercase().contains(&q)
+            })
             .map(|(i, _)| i)
             .collect();
         if self.selected >= self.shown.len() {
@@ -408,7 +432,11 @@ fn trunc(s: &str, width: usize) -> String {
 ///（延续「服务端错误翻人话」的思路，把「怎么办」也带上）。
 fn error_hint(note: &str) -> &'static str {
     let n = note.to_lowercase();
-    if n.contains("401") || n.contains("403") || n.contains("key") {
+    if n.contains("没在跑") || n.contains("没在响应") {
+        "先把守护进程跑起来：dictate run（终端视图），或直接运行 dictate"
+    } else if n.contains("保留的音频") || n.contains("keep_audio") {
+        "设置页（F2）把「保留音频」打开，下次录音后 /retry 就能用"
+    } else if n.contains("401") || n.contains("403") || n.contains("key") {
         "/key 换个 key（或 F2 设置里改），改完说一句试试"
     } else if n.contains("429") {
         "限流了，等一会儿再试"
@@ -417,31 +445,41 @@ fn error_hint(note: &str) -> &'static str {
     } else if n.contains("超时") || n.contains("timeout") {
         "网络不通或太慢：/base 换个区域，或稍后再试"
     } else {
-        "keep_audio 开着可 /retry 重转；仍不行跑 dictate doctor"
+        "跑 dictate doctor 逐项排查（key / 区域 / 热键 / 粘贴）"
     }
 }
 
-/// 历史条目按天分组的小标题。
-fn day_label_at(ts: &str, today: chrono::NaiveDate, yesterday: chrono::NaiveDate) -> String {
-    match chrono::DateTime::parse_from_rfc3339(ts) {
-        Ok(dt) => {
-            let d = dt.date_naive();
-            if d == today {
-                "今天".into()
-            } else if d == yesterday {
-                "昨天".into()
-            } else {
-                d.format("%m-%d").to_string()
-            }
-        }
-        Err(_) => ts.get(0..10).unwrap_or("").into(),
+/// 历史条目按天分组的小标题。今天/昨天按日历日期算（来自 ts_ms，不依赖追加序），
+/// 跨年的旧记录带上年份，否则「10-01」分不清是哪一年。
+fn day_label_at(
+    d: chrono::NaiveDate,
+    today: chrono::NaiveDate,
+    yesterday: chrono::NaiveDate,
+) -> String {
+    use chrono::Datelike as _;
+    if d == today {
+        "今天".into()
+    } else if d == yesterday {
+        "昨天".into()
+    } else if d.year() != today.year() {
+        d.format("%Y-%m-%d").to_string()
+    } else {
+        d.format("%m-%d").to_string()
     }
 }
 
-fn day_label(ts: &str) -> String {
-    let today = chrono::Local::now().date_naive();
-    let yesterday = today.pred_opt().unwrap_or(today);
-    day_label_at(ts, today, yesterday)
+/// 条目的日历日期：优先 ts_ms（load 时已回填并排序），旧格式坏行退回解析 ts 字符串。
+fn entry_date(e: &Entry) -> Option<chrono::NaiveDate> {
+    use chrono::TimeZone as _;
+    if e.ts_ms > 0 {
+        return chrono::Local
+            .timestamp_millis_opt(e.ts_ms as i64)
+            .single()
+            .map(|dt| dt.date_naive());
+    }
+    chrono::DateTime::parse_from_rfc3339(&e.ts)
+        .ok()
+        .map(|dt| dt.date_naive())
 }
 
 /// OSC 52：把文本放进终端所在机器的剪贴板（SSH 里也有效）。
@@ -500,6 +538,13 @@ struct StatusFile {
     text: Option<String>,
     #[serde(default)]
     error: Option<String>,
+    /// 非失败信息（按键太短、流式回退批量等），暗色显示、不带建议
+    #[serde(default)]
+    note: Option<String>,
+    /// 心跳（unix ms）。守护进程每次内容变化或每 3 秒刷新一次；
+    /// 超时未刷新且文件还在 = 进程崩了，状态是残留的
+    #[serde(default)]
+    hb_ms: u64,
     /// 流式中间文本（录音中才有）
     #[serde(default)]
     partial: Option<String>,
@@ -536,18 +581,25 @@ fn apply_status(app: &mut App) {
 }
 
 fn apply_status_from(path: &std::path::Path, app: &mut App) {
+    let now = crate::core::history::now_ms();
     let Ok(body) = std::fs::read_to_string(path) else {
         app.phase = Phase::Idle;
+        app.daemon_alive = false;
         app.daemon_note = "守护进程没在跑 —— 先执行 dictate".into();
         return;
     };
     let Ok(st) = serde_json::from_str::<StatusFile>(&body) else {
         return;
     };
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64;
+    // 心跳过期 = 进程崩了但状态文件残留：不再照着残留文件演「就绪/录音中」
+    if st.hb_ms > 0 && now.saturating_sub(st.hb_ms) > DAEMON_STALE_MS {
+        app.phase = Phase::Idle;
+        app.daemon_alive = false;
+        app.partial.clear();
+        app.daemon_note = "守护进程没在响应 —— 重启：dictate run".into();
+        return;
+    }
+    app.daemon_alive = true;
     let elapsed = Duration::from_millis(now.saturating_sub(st.since_ms));
     let at = Instant::now()
         .checked_sub(elapsed)
@@ -558,10 +610,11 @@ fn apply_status_from(path: &std::path::Path, app: &mut App) {
         _ => Phase::Idle,
     };
     app.partial = st.partial.clone().unwrap_or_default();
-    app.daemon_note = match (&st.error, &st.text) {
-        (Some(e), _) => format!("失败：{e}"),
-        (None, Some(t)) => format!("完成：{}", t.chars().take(40).collect::<String>()),
-        (None, None) => String::new(),
+    app.daemon_note = match (&st.error, &st.note, &st.text) {
+        (Some(e), _, _) => format!("失败：{e}"),
+        (None, Some(n), _) => n.clone(),
+        (None, None, Some(t)) => format!("完成：{}", t.chars().take(40).collect::<String>()),
+        (None, None, None) => String::new(),
     };
 }
 
@@ -622,6 +675,14 @@ fn send_control(cmd: &str) {
 }
 
 fn toggle_record(app: &mut App) {
+    // 守护进程不在就直说，别 toast「开始录音…」装作成功——控制文件写了也没人读
+    if !app.daemon_alive {
+        toast_err(
+            app,
+            "守护进程没在跑——先执行 dictate run（或直接运行 dictate）",
+        );
+        return;
+    }
     let recording = matches!(app.phase, Phase::Recording(_));
     send_control(if recording { "stop" } else { "start" });
     toast(
@@ -634,12 +695,16 @@ fn toggle_record(app: &mut App) {
     );
 }
 
-fn open_settings(app: &mut App) -> Result<()> {
-    let cfg = crate::core::config::load()?;
-    let mut form = crate::ui::settings_ui::Form::new(cfg);
-    form.theme = app.theme;
-    app.settings = Some(form);
-    Ok(())
+/// 打开设置页。配置读不出来（比如手改 TOML 写坏了语法）只报错，不炸掉整个视图。
+fn open_settings(app: &mut App) {
+    match crate::core::config::load() {
+        Ok(cfg) => {
+            let mut form = crate::ui::settings_ui::Form::new(cfg);
+            form.theme = app.theme;
+            app.settings = Some(form);
+        }
+        Err(e) => toast_err(app, format!("打开设置失败：{e:#}")),
+    }
 }
 
 /// 处理一个按键。输入行为和 grok-cli 一致：底部一行输入框，`/` 开头是命令，
@@ -658,11 +723,19 @@ fn handle_key(app: &mut App, k: &crossterm::event::KeyEvent) -> Result<Outcome> 
             Overlay::Help => app.overlay = None,
             Overlay::ConfirmClear => match k.code {
                 KeyCode::Enter => {
-                    app.history.clear()?;
+                    match app.history.clear() {
+                        Ok(()) => {
+                            toast(app, "已清空");
+                            app.marks.clear();
+                            app.overlay = None;
+                        }
+                        // 一次 IO 错误不该把整个 TUI 炸回 shell
+                        Err(e) => {
+                            toast_err(app, format!("清空失败：{e:#}"));
+                            app.overlay = None;
+                        }
+                    }
                     app.reload();
-                    app.marks.clear();
-                    toast(app, "已清空");
-                    app.overlay = None;
                 }
                 KeyCode::Esc => app.overlay = None,
                 _ => {}
@@ -730,7 +803,7 @@ fn handle_key(app: &mut App, k: &crossterm::event::KeyEvent) -> Result<Outcome> 
             return Ok(Outcome::Continue);
         }
         KeyCode::F(2) => {
-            open_settings(app)?;
+            open_settings(app);
             return Ok(Outcome::Continue);
         }
         KeyCode::F(10) => return Ok(Outcome::Quit),
@@ -827,9 +900,11 @@ fn handle_key(app: &mut App, k: &crossterm::event::KeyEvent) -> Result<Outcome> 
         KeyCode::Delete => {
             if let Some(e) = app.current() {
                 let id = e.id.clone();
-                app.history.delete(&id)?;
+                match app.history.delete(&id) {
+                    Ok(()) => toast(app, "已删除一条"),
+                    Err(err) => toast_err(app, format!("删除失败：{err:#}")),
+                }
                 app.reload();
-                toast(app, "已删除一条");
             }
         }
         // 输入为空时这些键是导航/操作，不进输入框（想按文字过滤就用别的字符起头）
@@ -914,44 +989,73 @@ fn run_input(app: &mut App) -> Result<()> {
     let mut parts = line.splitn(2, ' ');
     let cmd = parts.next().unwrap_or("");
     let arg = parts.next().unwrap_or("").trim().to_string();
+    // 命令里的配置读写一律「失败 toast、视图活着」——手改 TOML 写坏后按个键
+    // 不该把整个终端视图炸回 shell
+    let save_cfg =
+        |app: &mut App, cfg: &crate::core::config::Config| match crate::core::config::write(
+            &crate::core::config::config_path(),
+            cfg,
+        ) {
+            Ok(()) => true,
+            Err(e) => {
+                toast_err(app, format!("保存失败：{e:#}"));
+                false
+            }
+        };
     match cmd {
         "/help" => app.overlay = Some(Overlay::Help),
-        "/settings" => open_settings(app)?,
+        "/settings" => open_settings(app),
         "/model" => {
             if arg.is_empty() {
-                let cfg = crate::core::config::load()?;
-                let mut form = crate::ui::settings_ui::Form::new(cfg);
-                form.theme = app.theme;
-                form.open_model_picker();
-                app.settings = Some(form);
+                match crate::core::config::load() {
+                    Ok(cfg) => {
+                        let mut form = crate::ui::settings_ui::Form::new(cfg);
+                        form.theme = app.theme;
+                        form.open_model_picker();
+                        app.settings = Some(form);
+                    }
+                    Err(e) => toast_err(app, format!("读配置失败：{e:#}")),
+                }
             } else {
-                let mut cfg = crate::core::config::load()?;
-                if crate::asr::pick_style(&arg, None).is_err() {
-                    toast_err(app, format!("{arg} 不支持（异步 filetrans 没做）"));
-                } else {
-                    cfg.model = arg.clone();
-                    cfg.api_style = None;
-                    crate::core::config::write(&crate::core::config::config_path(), &cfg)?;
-                    toast(app, format!("模型 → {arg}（下次录音生效）"));
+                match crate::core::config::load() {
+                    Ok(mut cfg) => {
+                        if crate::asr::pick_style(&arg, None).is_err() {
+                            toast_err(app, format!("{arg} 不支持（异步 filetrans 没做）"));
+                        } else {
+                            cfg.model = arg.clone();
+                            cfg.api_style = None;
+                            if save_cfg(app, &cfg) {
+                                toast(app, format!("模型 → {arg}（下次录音生效）"));
+                            }
+                        }
+                    }
+                    Err(e) => toast_err(app, format!("读配置失败：{e:#}")),
                 }
             }
         }
         "/base" => {
             if arg.is_empty() {
-                let cfg = crate::core::config::load()?;
-                let mut form = crate::ui::settings_ui::Form::new(cfg);
-                form.theme = app.theme;
-                form.open_base_picker();
-                app.settings = Some(form);
-            } else {
-                let mut cfg = crate::core::config::load()?;
-                match crate::asr::normalize_base(&arg) {
-                    Ok(b) => {
-                        cfg.base_url = b;
-                        crate::core::config::write(&crate::core::config::config_path(), &cfg)?;
-                        toast(app, format!("服务地址 → {}", cfg.base_url));
+                match crate::core::config::load() {
+                    Ok(cfg) => {
+                        let mut form = crate::ui::settings_ui::Form::new(cfg);
+                        form.theme = app.theme;
+                        form.open_base_picker();
+                        app.settings = Some(form);
                     }
-                    Err(e) => toast_err(app, format!("地址不合法：{e}")),
+                    Err(e) => toast_err(app, format!("读配置失败：{e:#}")),
+                }
+            } else {
+                match crate::core::config::load() {
+                    Ok(mut cfg) => match crate::asr::normalize_base(&arg) {
+                        Ok(b) => {
+                            cfg.base_url = b;
+                            if save_cfg(app, &cfg) {
+                                toast(app, format!("服务地址 → {}", cfg.base_url));
+                            }
+                        }
+                        Err(e) => toast_err(app, format!("地址不合法：{e}")),
+                    },
+                    Err(e) => toast_err(app, format!("读配置失败：{e:#}")),
                 }
             }
         }
@@ -959,28 +1063,89 @@ fn run_input(app: &mut App) -> Result<()> {
             if arg.is_empty() {
                 toast(app, "用法：/key sk-…");
             } else {
-                let mut cfg = crate::core::config::load()?;
-                cfg.api_key = Some(arg);
-                crate::core::config::write(&crate::core::config::config_path(), &cfg)?;
-                toast(app, "已保存 key（存在配置文件里，权限 600）");
+                match crate::core::config::load() {
+                    Ok(mut cfg) => {
+                        cfg.api_key = Some(arg);
+                        if save_cfg(app, &cfg) {
+                            if std::env::var_os("DASHSCOPE_API_KEY")
+                                .map(|v| !v.is_empty())
+                                .unwrap_or(false)
+                            {
+                                toast(
+                                    app,
+                                    "已保存 key（但环境变量 DASHSCOPE_API_KEY 优先——unset 它才用这份）",
+                                );
+                            } else {
+                                toast(app, "已保存 key（存在配置文件里，权限 600）");
+                            }
+                        }
+                    }
+                    Err(e) => toast_err(app, format!("读配置失败：{e:#}")),
+                }
+            }
+        }
+        "/theme" => {
+            // 不带参数循环 auto → dark → light；带了就按参数（auto 会重新问终端背景色）
+            let next = if arg.is_empty() {
+                match crate::core::config::load()
+                    .ok()
+                    .and_then(|c| c.theme)
+                    .as_deref()
+                    .map(|s| s.trim().to_ascii_lowercase())
+                {
+                    Some(ref s) if s == "dark" => "light".to_string(),
+                    Some(ref s) if s == "light" => "auto".to_string(),
+                    _ => "dark".to_string(),
+                }
+            } else {
+                match arg.to_ascii_lowercase().as_str() {
+                    "auto" | "dark" | "light" => arg.to_ascii_lowercase(),
+                    _ => {
+                        toast_err(app, "用法：/theme auto|dark|light");
+                        app.input.clear();
+                        return Ok(());
+                    }
+                }
+            };
+            match crate::core::config::load() {
+                Ok(mut cfg) => {
+                    cfg.theme = if next == "auto" {
+                        None
+                    } else {
+                        Some(next.clone())
+                    };
+                    if save_cfg(app, &cfg) {
+                        app.theme = Theme::resolve(if next == "auto" { None } else { Some(&next) });
+                        toast(app, format!("配色 → {next}"));
+                    }
+                }
+                Err(e) => toast_err(app, format!("读配置失败：{e:#}")),
             }
         }
         "/hotkey" => match crate::hotkey::Spec::parse(&arg) {
-            Ok(_) => {
-                let mut cfg = crate::core::config::load()?;
-                cfg.hotkey = arg.clone();
-                crate::core::config::write(&crate::core::config::config_path(), &cfg)?;
-                toast(app, format!("热键 → {arg}（守护进程会自动热加载）"));
-            }
+            Ok(_) => match crate::core::config::load() {
+                Ok(mut cfg) => {
+                    cfg.hotkey = arg.clone();
+                    if save_cfg(app, &cfg) {
+                        toast(app, format!("热键 → {arg}（守护进程会自动热加载）"));
+                    }
+                }
+                Err(e) => toast_err(app, format!("读配置失败：{e:#}")),
+            },
             Err(e) => toast_err(app, format!("热键不合法：{e}")),
         },
         "/mode" => {
             let m = arg.to_ascii_lowercase();
             if m == "hold" || m == "toggle" {
-                let mut cfg = crate::core::config::load()?;
-                cfg.hotkey_mode = m.clone();
-                crate::core::config::write(&crate::core::config::config_path(), &cfg)?;
-                toast(app, format!("热键模式 → {m}"));
+                match crate::core::config::load() {
+                    Ok(mut cfg) => {
+                        cfg.hotkey_mode = m.clone();
+                        if save_cfg(app, &cfg) {
+                            toast(app, format!("热键模式 → {m}"));
+                        }
+                    }
+                    Err(e) => toast_err(app, format!("读配置失败：{e:#}")),
+                }
             } else {
                 toast(app, "用法：/mode hold|toggle");
             }
@@ -1021,7 +1186,7 @@ fn run_input(app: &mut App) -> Result<()> {
     Ok(())
 }
 
-fn draw(f: &mut ratatui::Frame, app: &App) {
+fn draw(f: &mut ratatui::Frame, app: &mut App) {
     if let Some(form) = &app.settings {
         crate::ui::settings_ui::draw_form(f, form);
         return;
@@ -1056,10 +1221,16 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
             Style::default().fg(th.dim),
         ),
     ]);
-    let (dot, mut dot_color, phase_text) = match app.phase {
-        Phase::Idle => ("●", th.ok, "就绪"),
-        Phase::Recording(_) => ("●", th.rec, "录音中"),
-        Phase::Transcribing(_) => ("◐", th.warn, "转写中"),
+    // 界面不装样子：守护不在/上次失败都要从顶栏读出来，不能照旧亮绿灯「就绪」
+    let (dot, mut dot_color, phase_text) = if !app.daemon_alive {
+        ("○", th.faint, "无守护")
+    } else {
+        match app.phase {
+            Phase::Idle if app.daemon_note.starts_with("失败") => ("●", th.rec, "上次失败"),
+            Phase::Idle => ("●", th.ok, "就绪"),
+            Phase::Recording(_) => ("●", th.rec, "录音中"),
+            Phase::Transcribing(_) => ("◐", th.warn, "转写中"),
+        }
     };
     // 录音时呼吸灯：500 ms 一闪
     if let Phase::Recording(t) = app.phase {
@@ -1067,10 +1238,16 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
             dot_color = th.faint;
         }
     }
+    // 条数只在顶栏出现一处：平时显示总数，筛选时显示 可见/总数
+    let count = if app.query.is_empty() {
+        format!("{} 条 ", app.all.len())
+    } else {
+        format!("{}/{} 条 ", app.shown.len(), app.all.len())
+    };
     let right = Line::from(vec![
         Span::styled(dot, Style::default().fg(dot_color)),
         Span::styled(
-            format!(" {phase_text}   {} 条 ", app.shown.len()),
+            format!(" {phase_text}   {count}"),
             Style::default().fg(th.dim),
         ),
     ])
@@ -1082,8 +1259,25 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
     f.render_widget(Paragraph::new(left), wide[0]);
     f.render_widget(Paragraph::new(right), wide[1]);
 
-    // ── 第二行：筛选状态 / 守护进程最近结果
-    if !app.query.is_empty() {
+    // ── 第二行：失败（带下一步建议）> 筛选状态 > 守护进程最近结果。
+    //    失败排最前：筛选期间发生的转写失败不能被「筛选 …」行遮掉
+    let note_bad = app.daemon_note.starts_with("失败")
+        || app.daemon_note.contains("没在跑")
+        || app.daemon_note.contains("没在响应");
+    if note_bad {
+        // 失败不只报红字：带上「下一步怎么办」
+        let hint = error_hint(&app.daemon_note);
+        let hint_w = UnicodeWidthStr::width(hint) + 5;
+        let budget = chunks[1].width.saturating_sub(hint_w as u16).max(10) as usize;
+        f.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled(trunc(&app.daemon_note, budget), Style::default().fg(th.rec)),
+                Span::styled("  →  ", Style::default().fg(th.faint)),
+                Span::styled(hint, Style::default().fg(th.dim)),
+            ])),
+            chunks[1],
+        );
+    } else if !app.query.is_empty() {
         f.render_widget(
             Paragraph::new(Line::from(vec![
                 Span::styled("筛选 ", Style::default().fg(th.faint)),
@@ -1091,40 +1285,23 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
                     trunc(&app.query, 30),
                     Style::default().fg(th.accent).add_modifier(Modifier::BOLD),
                 ),
-                Span::styled(
-                    format!("  {}/{} 条  Esc 清除", app.shown.len(), app.all.len()),
-                    Style::default().fg(th.faint),
-                ),
+                Span::styled("  Esc 清除", Style::default().fg(th.faint)),
             ])),
             chunks[1],
         );
     } else if !app.daemon_note.is_empty() {
-        let bad = app.daemon_note.starts_with("失败") || app.daemon_note.contains("没在跑");
-        if bad {
-            // 失败不只报红字：带上「下一步怎么办」
-            let hint = error_hint(&app.daemon_note);
-            let hint_w = UnicodeWidthStr::width(hint) + 5;
-            let budget = chunks[1].width.saturating_sub(hint_w as u16).max(10) as usize;
-            f.render_widget(
-                Paragraph::new(Line::from(vec![
-                    Span::styled(trunc(&app.daemon_note, budget), Style::default().fg(th.rec)),
-                    Span::styled("  →  ", Style::default().fg(th.faint)),
-                    Span::styled(hint, Style::default().fg(th.dim)),
-                ])),
-                chunks[1],
-            );
-        } else {
-            f.render_widget(
-                Paragraph::new(Line::from(Span::styled(
-                    trunc(&app.daemon_note, chunks[1].width.saturating_sub(2) as usize),
-                    Style::default().fg(th.dim),
-                ))),
-                chunks[1],
-            );
-        }
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                trunc(&app.daemon_note, chunks[1].width.saturating_sub(2) as usize),
+                Style::default().fg(th.dim),
+            ))),
+            chunks[1],
+        );
     }
 
-    // ── 历史列表：按天分组 + 自动折行
+    // ── 历史列表：按天分组 + 自动折行。
+    //    列表项（含折行、分组头）只在签名变化或每满一分钟时重建——签名覆盖
+    //    条数/选中位/标记数/筛选词/配色；平时每帧只是把现成条目交给 ratatui
     let list_area = chunks[2];
     if app.shown.is_empty() {
         let msg = if app.query.is_empty() {
@@ -1138,94 +1315,39 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
             list_area,
         );
     } else {
-        let mut items: Vec<ListItem> = Vec::new();
-        let mut first_item_of: Vec<usize> = Vec::with_capacity(app.shown.len());
-        let mut prev_day = String::new();
-        let body_w = (list_area.width.saturating_sub(LIST_PREFIX as u16 + 2)) as usize;
-
-        for (pos, i) in app.shown.iter().enumerate() {
-            let e = &app.all[*i];
-            let day = e.ts.get(0..10).unwrap_or("").to_string();
-            if day != prev_day {
-                prev_day = day;
-                let label = day_label(&e.ts);
-                let lw = UnicodeWidthStr::width(label.as_str());
-                let fill = list_area.width.saturating_sub(lw as u16 + 4).min(60) as usize;
-                items.push(ListItem::new(Line::from(Span::styled(
-                    format!(" {label} {}", "─".repeat(fill)),
-                    Style::default().fg(th.faint),
-                ))));
-            }
-            first_item_of.push(items.len());
-
-            let is_selected = pos == app.selected;
-            let is_marked = app.marks.contains(&e.id);
-            let time = e.ts.get(11..16).unwrap_or("--:--");
-            let (body, color) = if e.is_ok() {
-                (e.text.replace('\n', " "), Color::Reset)
-            } else {
-                (
-                    e.status.trim_start_matches("error: ").replace('\n', " "),
-                    th.rec,
-                )
-            };
-            let lines = wrap_width(&body, body_w);
-            let last = lines.len() - 1;
-            for (li, text) in lines.iter().enumerate() {
-                let mut spans: Vec<Span> = Vec::new();
-                if li == 0 {
-                    spans.push(Span::styled(
-                        if is_marked {
-                            "✓"
-                        } else if is_selected {
-                            "▌"
-                        } else {
-                            " "
-                        }
-                        .to_string(),
-                        Style::default().fg(th.accent),
-                    ));
-                    spans.push(Span::styled(
-                        format!(" {time}  "),
-                        Style::default().fg(th.faint),
-                    ));
-                    spans.push(Span::styled("❯ ", Style::default().fg(th.accent)));
-                } else {
-                    spans.push(Span::raw(" ".repeat(LIST_PREFIX)));
-                }
-                spans.push(Span::styled(text.clone(), Style::default().fg(color)));
-                if li == last {
-                    spans.push(Span::styled(
-                        format!(
-                            "  {:.1}s → {:.1}s",
-                            e.duration_ms as f32 / 1000.0,
-                            e.latency_ms as f32 / 1000.0
-                        ),
-                        Style::default().fg(th.faint),
-                    ));
-                }
-                let mut line = Line::from(spans);
-                if is_selected {
-                    line = line.style(Style::default().bg(th.selected_bg));
-                }
-                items.push(ListItem::new(line));
-            }
+        let sig = format!(
+            "{}|{}|{:?}|{}|{}|{}|{}|{}",
+            app.all.len(),
+            app.shown.len(),
+            app.shown.first(),
+            app.selected,
+            app.marks.len(),
+            app.query,
+            app.theme.mode as u8,
+            list_area.width,
+        );
+        if sig != app.list_sig || app.list_at.elapsed() > Duration::from_secs(60) {
+            rebuild_list(app, list_area.width);
+            app.list_sig = sig;
+            app.list_at = Instant::now();
         }
-
-        let list = List::new(items)
+        let list = List::new(app.list_items.clone())
             .highlight_style(Style::default().bg(th.selected_bg))
             .highlight_symbol("");
         let mut state = ListState::default();
-        state.select(first_item_of.get(app.selected).copied());
+        state.select(app.list_first_of.get(app.selected).copied());
         f.render_stateful_widget(list, list_area, &mut state);
     }
 
-    // ── 流式字幕：录音中把中间文本顶在列表上方，边说边出字
+    // ── 流式字幕：录音中把中间文本顶在列表上方，边说边出字。
+    //    只画**最后 4 行**——最新说的话在尾部，取头部会让字幕看似冻结
     if let Phase::Recording(_) = app.phase {
         if !app.partial.is_empty() {
             let w = list_area.width.saturating_sub(4);
             let lines = wrap_width(&app.partial, w as usize);
-            let n = (lines.len() as u16).min(4);
+            let skip = lines.len().saturating_sub(4);
+            let view = &lines[skip..];
+            let n = view.len() as u16;
             let rect = Rect {
                 x: list_area.x + 2,
                 y: list_area.y + 1,
@@ -1233,14 +1355,16 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
                 height: n,
             };
             clear_with_margin(f, rect);
-            let rows: Vec<Line> = lines
+            let rows: Vec<Line> = view
                 .iter()
-                .take(4)
                 .enumerate()
                 .map(|(i, l)| {
                     let mut spans = Vec::new();
                     if i == 0 {
                         spans.push(Span::styled("● ", Style::default().fg(th.rec)));
+                        if skip > 0 {
+                            spans.push(Span::styled("… ", Style::default().fg(th.faint)));
+                        }
                     } else {
                         spans.push(Span::raw("  "));
                     }
@@ -1460,6 +1584,118 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
     }
 }
 
+/// 重建历史列表条目。折行结果按 (id, 宽度) 缓存——条目一旦落库就不变，
+/// 所以只有首次（或宽度变化）才真正做宽度计算。
+fn rebuild_list(app: &mut App, width: u16) {
+    let th = app.theme;
+    let today = chrono::Local::now().date_naive();
+    let yesterday = today.pred_opt().unwrap_or(today);
+    let body_w = (width.saturating_sub(LIST_PREFIX as u16 + 2)) as usize;
+    // 缓存条数远超条目数（宽度来回变）时整体丢弃，防止无界增长
+    if app.wrap_cache.len() > app.all.len() * 3 + 128 {
+        app.wrap_cache.clear();
+    }
+
+    /// 分组键：正常条目用日历日期（来自 ts_ms，与追加序无关）；坏行退回 ts 前缀
+    enum DayKey {
+        D(chrono::NaiveDate),
+        Raw(String),
+    }
+
+    let mut items: Vec<ListItem> = Vec::with_capacity(app.shown.len() + 8);
+    let mut first_of: Vec<usize> = Vec::with_capacity(app.shown.len());
+    let mut prev_key: Option<DayKey> = None;
+
+    for (pos, i) in app.shown.iter().enumerate() {
+        let e = &app.all[*i];
+        let key = match entry_date(e) {
+            Some(d) => DayKey::D(d),
+            None => DayKey::Raw(e.ts.get(0..10).unwrap_or("").to_string()),
+        };
+        let new_day = match (&prev_key, &key) {
+            (Some(DayKey::D(a)), DayKey::D(b)) => a != b,
+            (Some(DayKey::Raw(a)), DayKey::Raw(b)) => a != b,
+            _ => true,
+        };
+        if new_day {
+            let label = match &key {
+                DayKey::D(d) => day_label_at(*d, today, yesterday),
+                DayKey::Raw(r) => r.clone(),
+            };
+            let lw = UnicodeWidthStr::width(label.as_str());
+            // 分隔线画满整行（宽终端下不再被 60 列截短）
+            let fill = width.saturating_sub(lw as u16 + 4) as usize;
+            items.push(ListItem::new(Line::from(Span::styled(
+                format!(" {label} {}", "─".repeat(fill)),
+                Style::default().fg(th.faint),
+            ))));
+            prev_key = Some(key);
+        }
+        first_of.push(items.len());
+
+        let is_selected = pos == app.selected;
+        let is_marked = app.marks.contains(&e.id);
+        let time = e.ts.get(11..16).unwrap_or("--:--");
+        let (body, color) = if e.is_ok() {
+            (e.text.replace('\n', " "), Color::Reset)
+        } else {
+            (
+                e.status.trim_start_matches("error: ").replace('\n', " "),
+                th.rec,
+            )
+        };
+        let lines = app
+            .wrap_cache
+            .entry((e.id.clone(), body_w))
+            .or_insert_with(|| wrap_width(&body, body_w))
+            .clone();
+        let last = lines.len() - 1;
+        for (li, text) in lines.iter().enumerate() {
+            let mut spans: Vec<Span> = Vec::new();
+            if li == 0 {
+                // 首列只表达选中（▌）；标记 ✓ 没抢位置，挪到行尾——
+                // 选中态不能再只剩 16% 的底色差
+                spans.push(Span::styled(
+                    if is_selected { "▌" } else { " " }.to_string(),
+                    Style::default().fg(th.accent),
+                ));
+                spans.push(Span::styled(
+                    format!(" {time}  "),
+                    Style::default().fg(th.faint),
+                ));
+                spans.push(Span::styled("❯ ", Style::default().fg(th.accent)));
+            } else {
+                spans.push(Span::raw(" ".repeat(LIST_PREFIX)));
+            }
+            spans.push(Span::styled(text.clone(), Style::default().fg(color)));
+            if li == last {
+                if is_marked {
+                    spans.push(Span::styled(" ✓", Style::default().fg(th.accent)));
+                }
+                // 错误条目 latency 恒 0，"→ 0.0s" 是没测不是瞬时——不显示
+                if e.is_ok() {
+                    spans.push(Span::styled(
+                        format!(
+                            "  {:.1}s → {:.1}s",
+                            e.duration_ms as f32 / 1000.0,
+                            e.latency_ms as f32 / 1000.0
+                        ),
+                        Style::default().fg(th.faint),
+                    ));
+                }
+            }
+            let mut line = Line::from(spans);
+            if is_selected {
+                line = line.style(Style::default().bg(th.selected_bg));
+            }
+            items.push(ListItem::new(line));
+        }
+    }
+
+    app.list_items = items;
+    app.list_first_of = first_of;
+}
+
 /// 居中样式的浮动小面板（圆角 + 标题 + 清底）。
 fn render_float_box(f: &mut ratatui::Frame, th: Theme, rect: Rect, title: &str, rows: Vec<Line>) {
     clear_with_margin(f, rect);
@@ -1515,12 +1751,16 @@ fn draw_overlay(f: &mut ratatui::Frame, app: &App, ov: Overlay) {
             " 帮助 ",
             vec![
                 Line::from(Span::styled(
-                    format!("热键 {}（hold 按住说话 / toggle 按一下开关）", app.subtitle),
+                    // subtitle 是「热键 · 模型」拼接，只取热键那段，别把模型名读成热键
+                    format!(
+                        "热键 {}（hold 按住说话 / toggle 按一下开关）",
+                        app.subtitle.split(" · ").next().unwrap_or(&app.subtitle)
+                    ),
                     Style::default().fg(th.dim),
                 )),
                 Line::from(""),
                 Line::from("导航    ↑↓ 或 j k 选择    g 最新    G 最旧"),
-                Line::from("        Ctrl+D / Ctrl+U 翻半页"),
+                Line::from("        Ctrl+D / Ctrl+U 快速跳 12 条"),
                 Line::from(""),
                 Line::from("录音    空格 或 /record 手动开始 / 停止"),
                 Line::from(""),
@@ -1529,6 +1769,7 @@ fn draw_overlay(f: &mut ratatui::Frame, app: &App, ov: Overlay) {
                 Line::from(""),
                 Line::from("命令    / 打开命令面板：↑↓ 选、⏎ 执行、Tab 补全"),
                 Line::from("        /model 或 /base 敲个空格 = 直接列表选"),
+                Line::from("        /theme 切配色 · /key 存 key（输入行打码）"),
                 Line::from("        直接打字 = 实时过滤历史（Esc 清除）"),
                 Line::from(""),
                 Line::from("其它    F2 设置   Ctrl+R 刷新   Ctrl+L 清空历史"),
@@ -1753,21 +1994,24 @@ mod tests {
     fn day_labels_today_yesterday_and_date() {
         let today = chrono::NaiveDate::from_ymd_opt(2026, 10, 24).unwrap();
         let yesterday = today.pred_opt().unwrap();
+        assert_eq!(day_label_at(today, today, yesterday), "今天");
+        assert_eq!(day_label_at(yesterday, today, yesterday), "昨天");
         assert_eq!(
-            day_label_at("2026-10-24T10:00:00+08:00", today, yesterday),
-            "今天"
-        );
-        assert_eq!(
-            day_label_at("2026-10-23T22:00:00+08:00", today, yesterday),
-            "昨天"
-        );
-        assert_eq!(
-            day_label_at("2026-10-01T08:00:00+08:00", today, yesterday),
+            day_label_at(
+                chrono::NaiveDate::from_ymd_opt(2026, 10, 1).unwrap(),
+                today,
+                yesterday
+            ),
             "10-01"
         );
+        // 跨年要带年份，否则分不清是哪一年
         assert_eq!(
-            day_label_at("不是时间", today, yesterday),
-            "不是时间".get(0..10).unwrap_or("")
+            day_label_at(
+                chrono::NaiveDate::from_ymd_opt(2025, 10, 1).unwrap(),
+                today,
+                yesterday
+            ),
+            "2025-10-01"
         );
     }
 
@@ -1945,6 +2189,32 @@ mod tests {
         std::fs::write(&path, r#"{"phase":"idle","since_ms":0,"error":"HTTP 401"}"#).unwrap();
         apply_status_from(&path, &mut app);
         assert!(app.daemon_note.contains("401"));
+        assert!(
+            app.daemon_note.starts_with("失败"),
+            "错误要走失败通道（红字+建议）"
+        );
+
+        // note 通道：非失败信息（防抖忽略、流式回退）不该渲染成失败
+        std::fs::write(
+            &path,
+            r#"{"phase":"idle","since_ms":0,"note":"按键太短，已忽略"}"#,
+        )
+        .unwrap();
+        apply_status_from(&path, &mut app);
+        assert!(app.daemon_note.contains("按键太短"));
+        assert!(!app.daemon_note.starts_with("失败"));
+
+        // 心跳过期 = 守护进程崩了但状态文件残留，不能再照着演「就绪/录音中」
+        let stale = crate::core::history::now_ms().saturating_sub(DAEMON_STALE_MS + 60_000);
+        std::fs::write(
+            &path,
+            format!(r#"{{"phase":"recording","since_ms":0,"hb_ms":{stale}}}"#),
+        )
+        .unwrap();
+        apply_status_from(&path, &mut app);
+        assert!(!app.daemon_alive, "心跳过期应判定守护进程已死");
+        assert!(matches!(app.phase, Phase::Idle));
+        assert!(app.daemon_note.contains("没在响应"));
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -1967,13 +2237,14 @@ mod tests {
     // ── 离屏渲染：不用真终端也能看布局 ──
 
     fn render(app: &App, input: &str, w: u16, h: u16) -> String {
-        let a = App {
+        let mut a = App {
             history: History::new(std::path::Path::new("/nonexistent")),
             all: app.all.clone(),
             shown: app.shown.clone(),
             query: app.query.clone(),
             selected: app.selected,
             daemon_note: app.daemon_note.clone(),
+            daemon_alive: app.daemon_alive,
             partial: app.partial.clone(),
             phase: app.phase,
             subtitle: app.subtitle.clone(),
@@ -1985,9 +2256,14 @@ mod tests {
             marks: app.marks.clone(),
             toast: app.toast.clone(),
             quit_requested: false,
+            wrap_cache: std::collections::HashMap::new(),
+            list_items: Vec::new(),
+            list_first_of: Vec::new(),
+            list_sig: String::new(),
+            list_at: Instant::now(),
         };
         let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, h)).unwrap();
-        term.draw(|f| draw(f, &a)).unwrap();
+        term.draw(|f| draw(f, &mut a)).unwrap();
         let buf = term.backend().buffer().clone();
         let mut out = String::new();
         for y in 0..h {
@@ -2148,7 +2424,12 @@ mod tests {
         assert!(error_hint("失败：HTTP 429 Too Many Requests").contains("限流"));
         assert!(error_hint("没有检测到语音：峰值 -90 dBFS，低于门限 -35 dBFS").contains("probe"));
         assert!(error_hint("失败：请求超时").contains("/base"));
-        assert!(error_hint("失败：别的什么").contains("/retry"));
+        // /retry 撞墙时建议必须是「打开保留音频」，不能让用户再跑一次 /retry 原地打转
+        assert!(
+            error_hint("没有保留的音频——keep_audio = true 后的录音才能重转").contains("保留音频")
+        );
+        assert!(error_hint("守护进程没在跑 —— 先执行 dictate").contains("dictate run"));
+        assert!(error_hint("失败：别的什么").contains("doctor"));
     }
 
     #[test]
@@ -2179,5 +2460,59 @@ mod tests {
             !scr.replace(' ', "").contains("残留文本"),
             "非录音态不该有字幕"
         );
+    }
+
+    #[test]
+    fn caption_shows_the_latest_lines_not_the_first() {
+        // 字幕超 4 行时要显示尾部（正在说的话），取头部会让字幕看似冻结
+        let today = chrono::Local::now().date_naive();
+        let mut app = demo_app(today, "capt3");
+        app.phase = Phase::Recording(std::time::Instant::now());
+        let mut partial = String::new();
+        for i in 0..8 {
+            // 每句约一行宽（100 列终端、字幕区 96 列），8 句 = 8 行，字幕只留最后 4 行
+            partial.push_str(&format!("第{i}句话{}。", "很长".repeat(20)));
+        }
+        app.partial = partial;
+        let scr = render(&app, "", 100, 24);
+        let compact: String = scr.chars().filter(|c| !c.is_whitespace()).collect();
+        assert!(compact.contains("第7句"), "字幕应包含最新的内容：{compact}");
+        assert!(!compact.contains("第0句"), "旧内容应该滚出字幕区");
+    }
+
+    #[test]
+    fn filter_matches_error_status_so_failures_stay_visible() {
+        // 错误条目 text 为空：只匹配 text 会把刚发生的失败从筛选视图里藏掉
+        let dir = std::env::temp_dir().join(format!("dictate-filt-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("history.jsonl");
+        use std::io::Write;
+        let mut f = std::fs::File::create(&path).unwrap();
+        writeln!(
+            f,
+            "{}",
+            serde_json::json!({
+                "id": "e1", "ts": "2026-10-26T10:00:00+08:00", "ts_ms": 1,
+                "duration_ms": 900, "latency_ms": 0, "model": "m",
+                "status": "error: HTTP 401 Unauthorized：key 不对", "text": ""
+            })
+        )
+        .unwrap();
+        writeln!(
+            f,
+            "{}",
+            serde_json::json!({
+                "id": "ok1", "ts": "2026-10-26T10:01:00+08:00", "ts_ms": 2,
+                "duration_ms": 900, "latency_ms": 100, "model": "m",
+                "status": "ok", "text": "正常的一条"
+            })
+        )
+        .unwrap();
+        let mut app = App::new(History::new(&path), Theme::dark());
+        app.query = "401".into();
+        app.refilter();
+        assert_eq!(app.shown.len(), 1, "筛 401 应命中错误条目");
+        assert_eq!(app.all[app.shown[0]].id, "e1");
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

@@ -30,5 +30,23 @@ timeout_secs = 60
 streaming = true
 
 # 把每次送到服务端的 WAV 留一份到 ~/.local/share/dictate/last.wav，
-# 转写失败后可用 /retry 或托盘菜单「重转上一条」重转，不用重说
+# 转写失败后可用 /retry 或托盘菜单「重转上一条」重转，不用重说（设置页也能开）
 keep_audio = false
+
+# 历史最多留多少条，0 = 不限。超出裁掉最旧的（带 10% 滞回）
+# keep_entries = 0
+
+# 配色：auto（问终端背景色，默认）/ dark / light。终端里 /theme 可随时切
+# theme = "auto"
+
+# 颜色开关：auto（默认，尊重 NO_COLOR）/ always / never
+# color = "auto"
+
+# 热键语义：hold（按住说话，默认）/ toggle（按一下开、再按一下停）
+# hotkey_mode = "hold"
+
+# 输入设备名（留空 = 系统默认）。`dictate devices` 列出来
+# input_device = ""
+
+# 转写完成后怎么交付：auto（剪贴板 + 模拟粘贴，默认）/ clipboard（只写剪贴板）/ off（只进历史）
+# paste = "auto"
