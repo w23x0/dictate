@@ -33,8 +33,7 @@ dictate history    # 终端里看历史（实时）
 | `qwen3-asr-flash` | OpenAI 兼容 `compatible-mode/v1/chat/completions` |
 | `qwen-audio-3.1-asr-flash` | DashScope 同步 `multimodal-generation/generation` |
 | `qwen-audio-3.1-asr-flash-message` 等 | WebSocket `api-ws/v1/inference` |
-
-`*-filetrans`（异步任务接口）未实现。
+| `*-filetrans` | DashScope 异步 `services/audio/asr/transcription`（上传 → 建任务 → 轮询，延迟高于同步模型） |
 
 ## 其它
 

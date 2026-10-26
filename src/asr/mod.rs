@@ -1,15 +1,16 @@
-//! 通义千问 ASR：三种报文形状，按模型名自动选，也可用配置 `api_style` 强制。
+//! 通义千问 ASR：四种报文形状，按模型名自动选，也可用配置 `api_style` 强制。
 //!
 //! | 模型 | 形状 | 端点 |
 //! |---|---|---|
 //! | `qwen3-asr-flash` | OpenAI 兼容 | `{base}/compatible-mode/v1/chat/completions` |
 //! | `qwen-audio-3.x-asr-flash` | DashScope 同步 | `{base}/api/v1/services/aigc/multimodal-generation/generation` |
 //! | `…-message` / `…-streaming` / `qwen3-asr-flash-realtime` | WebSocket | `wss://{host}/api-ws/v1/inference` |
+//! | `…-filetrans` | DashScope 异步 | `{base}/api/v1/services/audio/asr/transcription` |
 //!
-//! `*-filetrans` 走的是「上传 → 建异步任务 → 轮询」，本项目不实现，选到它会直接报错，
-//! 而不是发一个注定失败的请求。
+//! 异步形状是「拿上传凭证 → OSS 表单上传 → 建任务 → 轮询 → 取结果」，见 [`filetrans`]。
 
 mod dashscope;
+mod filetrans;
 mod openai;
 pub(crate) mod ws;
 
@@ -37,6 +38,8 @@ pub enum Style {
     DashScope,
     /// `api-ws/v1/inference`（run-task / finish-task）
     Ws,
+    /// `services/audio/asr/transcription`（上传 → 建异步任务 → 轮询）
+    FileTrans,
 }
 
 impl Style {
@@ -45,6 +48,7 @@ impl Style {
             Style::OpenAi => "openai-compatible",
             Style::DashScope => "dashscope-sync",
             Style::Ws => "websocket",
+            Style::FileTrans => "dashscope-filetrans",
         }
     }
 }
@@ -83,6 +87,7 @@ impl QwenClient {
             Style::OpenAi => openai::transcribe(self, wav)?,
             Style::DashScope => dashscope::transcribe(self, wav)?,
             Style::Ws => ws::transcribe(self, wav)?,
+            Style::FileTrans => filetrans::transcribe(self, wav)?,
         };
         Ok(Transcript {
             text,
@@ -100,6 +105,9 @@ impl QwenClient {
                 )
             }
             Style::Ws => format!("{}/api-ws/v1/inference", self.base),
+            Style::FileTrans => {
+                format!("{}/api/v1/services/audio/asr/transcription", self.base)
+            }
         }
     }
 
@@ -136,21 +144,20 @@ pub fn normalize_base(raw: &str) -> Result<String> {
     Ok(out)
 }
 
-/// 模型名 → 报文形状。`api_style` 有值时以它为准（`openai` / `dashscope` / `ws`）。
+/// 模型名 → 报文形状。`api_style` 有值时以它为准（`openai` / `dashscope` / `ws` / `filetrans`）；
+/// 但 `*-filetrans` 模型只认异步接口，不给改形状（改了也是注定失败的请求）。
 pub fn pick_style(model: &str, configured: Option<&str>) -> Result<Style> {
     let m = model.to_ascii_lowercase();
     if m.contains("filetrans") {
-        bail!(
-            "`{model}` 只能走 DashScope 异步任务（上传 → 建任务 → 轮询），本项目没实现；\
-             换用同步模型（qwen3-asr-flash / qwen-audio-3.1-asr-flash）"
-        );
+        return Ok(Style::FileTrans);
     }
     if let Some(style) = configured {
         return match style.trim().to_ascii_lowercase().as_str() {
             "openai" | "openai-compatible" => Ok(Style::OpenAi),
             "dashscope" | "dashscope-sync" => Ok(Style::DashScope),
             "ws" | "websocket" | "realtime" => Ok(Style::Ws),
-            other => bail!("未知的 api_style：{other}（可选 openai / dashscope / ws）"),
+            "filetrans" | "async" => Ok(Style::FileTrans),
+            other => bail!("未知的 api_style：{other}（可选 openai / dashscope / ws / filetrans）"),
         };
     }
     if m.ends_with("-message") || m.contains("-streaming") || m.ends_with("-realtime") {
@@ -260,7 +267,23 @@ mod tests {
             pick_style("qwen3-asr-flash-realtime", None).unwrap(),
             Style::Ws
         );
-        assert!(pick_style("qwen3-asr-flash-filetrans", None).is_err());
+        assert_eq!(
+            pick_style("qwen3-asr-flash-filetrans", None).unwrap(),
+            Style::FileTrans
+        );
+        assert_eq!(
+            pick_style("qwen-audio-3.1-asr-flash-filetrans", None).unwrap(),
+            Style::FileTrans
+        );
+        // filetrans 模型不给 api_style 改形状
+        assert_eq!(
+            pick_style("qwen3-asr-flash-filetrans", Some("openai")).unwrap(),
+            Style::FileTrans
+        );
+        assert_eq!(
+            pick_style("qwen3-asr-flash", Some("filetrans")).unwrap(),
+            Style::FileTrans
+        );
     }
 
     #[test]

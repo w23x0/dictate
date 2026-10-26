@@ -1,4 +1,4 @@
-//! 三种报文形状的端到端测试：起本地假服务端，走真 socket。
+//! 四种报文形状的端到端测试：起本地假服务端，走真 socket。
 //!
 //! 目的是把「报文对不对、事件顺序对不对、结果取哪一路」钉在测试里，
 //! 不依赖 API key 与公网。
@@ -197,6 +197,148 @@ fn websocket_shape_end_to_end() {
     assert_eq!(run["payload"]["parameters"]["language_hints"][0], "zh");
     let fin: Value = serde_json::from_str(&seen[1]).unwrap();
     assert_eq!(fin["header"]["action"], "finish-task");
+}
+
+/// 假服务端（异步任务版）：一条线程按顺序接待
+/// getPolicy → OSS 上传 → 建任务 → 轮询（PENDING→SUCCEEDED）→ 取结果，共 6 个请求。
+fn filetrans_server() -> (String, std::thread::JoinHandle<Vec<String>>) {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let base = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+    let b = base.clone();
+    let handle = std::thread::spawn(move || {
+        let mut seen = Vec::new();
+        for _ in 0..6 {
+            let (mut sock, _) = listener.accept().unwrap();
+            let mut buf = Vec::new();
+            let mut tmp = [0u8; 4096];
+            let header_end = loop {
+                let n = sock.read(&mut tmp).unwrap();
+                assert!(n > 0, "客户端没发请求");
+                buf.extend_from_slice(&tmp[..n]);
+                if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                    break pos + 4;
+                }
+            };
+            let head = String::from_utf8_lossy(&buf[..header_end]).to_string();
+            let len: usize = head
+                .lines()
+                .find_map(|l| {
+                    let (k, v) = l.split_once(':')?;
+                    k.eq_ignore_ascii_case("content-length")
+                        .then(|| v.trim().parse().ok())?
+                })
+                .unwrap_or(0);
+            let mut body = buf[header_end..].to_vec();
+            while body.len() < len {
+                let n = sock.read(&mut tmp).unwrap();
+                if n == 0 {
+                    break;
+                }
+                body.extend_from_slice(&tmp[..n]);
+            }
+            let req_line = head.lines().next().unwrap().to_string();
+            let body_s = String::from_utf8_lossy(&body).to_string();
+            seen.push(format!("{head}{body_s}"));
+
+            let reply: String = if req_line.starts_with("GET /api/v1/uploads") {
+                format!(
+                    r#"{{"request_id":"r0","data":{{"policy":"pol","signature":"sig","upload_dir":"DASHSCOPE","upload_host":"{b}","oss_access_key_id":"ak","x_oss_object_acl":"private","x_oss_forbid_overwrite":"true"}}}}"#
+                )
+            } else if req_line.starts_with("POST / ") {
+                String::new()
+            } else if req_line.starts_with("POST /api/v1/services/audio/asr/transcription") {
+                r#"{"request_id":"r1","output":{"task_id":"t-e2e","task_status":"PENDING"}}"#.into()
+            } else if req_line.starts_with("GET /api/v1/tasks/t-e2e") {
+                if seen.len() == 4 {
+                    r#"{"request_id":"r2","output":{"task_id":"t-e2e","task_status":"PENDING"}}"#
+                        .into()
+                } else {
+                    format!(
+                        r#"{{"output":{{"task_id":"t-e2e","task_status":"SUCCEEDED","results":[{{"file_url":"oss://DASHSCOPE/x.wav","subtask_status":"SUCCEEDED","transcription_url":"{b}/fake-result.json"}}]}}}}"#
+                    )
+                }
+            } else {
+                r#"{"transcripts":[{"channel_id":0,"text":"异步转写成功。"}]}"#.into()
+            };
+            let payload = reply.as_bytes();
+            write!(
+                sock,
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                payload.len()
+            )
+            .unwrap();
+            sock.write_all(payload).unwrap();
+        }
+        seen
+    });
+    (base, handle)
+}
+
+#[test]
+fn filetrans_shape_end_to_end() {
+    let (base, srv) = filetrans_server();
+    let c = client(base, "qwen3-asr-flash-filetrans", Style::FileTrans);
+    let out = super::filetrans::transcribe(&c, b"RIFF....").unwrap();
+    assert_eq!(out, "异步转写成功。");
+
+    let seen = srv.join().unwrap();
+    // 1. getPolicy：模型名跟着走
+    assert!(
+        seen[0].starts_with("GET /api/v1/uploads?action=getPolicy&model=qwen3-asr-flash-filetrans"),
+        "{}",
+        seen[0]
+    );
+    // 2. OSS PostObject：multipart、字段在前 file 殿后、key 带上传目录
+    assert!(seen[1].starts_with("POST / "), "{}", seen[1]);
+    assert!(seen[1]
+        .to_lowercase()
+        .contains("content-type: multipart/form-data; boundary="));
+    for f in [
+        "OSSAccessKeyId",
+        "Signature",
+        "policy",
+        "key",
+        "success_action_status",
+    ] {
+        assert!(seen[1].contains(&format!("name=\"{f}\"")), "缺 {f}");
+    }
+    assert!(
+        seen[1].find("name=\"key\"").unwrap() < seen[1].find("name=\"file\"").unwrap(),
+        "file 必须是最后一个字段"
+    );
+    assert!(seen[1].contains("DASHSCOPE/dictate-"), "{}", seen[1]);
+    assert!(seen[1].contains("RIFF...."));
+    // 3. 建任务：异步头 + oss:// 引用 + parameters 必须存在（qwen-audio 系缺它直接失败）
+    assert!(
+        seen[2].starts_with("POST /api/v1/services/audio/asr/transcription"),
+        "{}",
+        seen[2]
+    );
+    assert!(seen[2].to_lowercase().contains("x-dashscope-async: enable"));
+    let submit: Value = serde_json::from_str(seen[2].split("\r\n\r\n").nth(1).unwrap()).unwrap();
+    assert_eq!(submit["model"], "qwen3-asr-flash-filetrans");
+    assert!(submit["input"]["file_urls"][0]
+        .as_str()
+        .unwrap()
+        .starts_with("oss://DASHSCOPE/dictate-"));
+    assert_eq!(submit["parameters"]["language_hints"][0], "zh");
+    // 4/5. 轮询：带鉴权
+    assert!(
+        seen[3].starts_with("GET /api/v1/tasks/t-e2e"),
+        "{}",
+        seen[3]
+    );
+    assert!(seen[3]
+        .to_lowercase()
+        .contains("authorization: bearer test-key"));
+    assert!(
+        seen[4].starts_with("GET /api/v1/tasks/t-e2e"),
+        "{}",
+        seen[4]
+    );
+    // 6. 取结果：签名 URL，不带鉴权
+    assert!(seen[5].starts_with("GET /fake-result.json"), "{}", seen[5]);
+    assert!(!seen[5].to_lowercase().contains("authorization"));
 }
 
 /// 假 WS 服务端（流式版）：收到第一帧音频就给中间结果，

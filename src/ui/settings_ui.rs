@@ -30,7 +30,7 @@ fn pad(s: &str, width: usize) -> String {
     }
 }
 
-/// 支持的模型（只列真的能用这三种报文形状跑的）。tui 的 /model 参数面板共用。
+/// 支持的模型（四种报文形状都能跑）。tui 的 /model 参数面板共用。
 pub(crate) const MODELS: &[(&str, &str)] = &[
     (
         "qwen3-asr-flash",
@@ -44,6 +44,14 @@ pub(crate) const MODELS: &[(&str, &str)] = &[
     ),
     ("qwen-audio-3.1-asr-flash-streaming", "WebSocket 流式输出"),
     ("qwen3-asr-flash-realtime", "WebSocket 实时"),
+    (
+        "qwen3-asr-flash-filetrans",
+        "DashScope 异步 · 上传转写，延迟高",
+    ),
+    (
+        "qwen-audio-3.1-asr-flash-filetrans",
+        "DashScope 异步 · 上传转写，延迟高",
+    ),
 ];
 
 pub(crate) const BASES: &[(&str, &str)] = &[

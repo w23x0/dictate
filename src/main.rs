@@ -148,6 +148,7 @@ fn cmd_doctor() -> Result<()> {
         "端点：{}",
         match (&probe, style) {
             (Some(c), Some(asr::Style::Ws)) => c.ws_url().unwrap_or_default(),
+            (Some(c), _) => c.http_endpoint(),
             _ => cfg.endpoint(),
         }
     );

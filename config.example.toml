@@ -11,7 +11,7 @@ model = "qwen3-asr-flash"
 # 逆文本规范化（数字、单位）。听写默认关。
 enable_itn = false
 
-# 报文形状：留空按模型名推断；可选 openai / dashscope / ws
+# 报文形状：留空按模型名推断；可选 openai / dashscope / ws / filetrans
 # api_style = "dashscope"
 
 # 热键

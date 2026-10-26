@@ -135,7 +135,7 @@ Wayland 下的按键注入：
 | `qwen3-asr-flash` | OpenAI 兼容 | `{base}/compatible-mode/v1/chat/completions` |
 | `qwen-audio-3.1-asr-flash` · `qwen-audio-3.0-asr-flash` | DashScope 同步 | `{base}/api/v1/services/aigc/multimodal-generation/generation` |
 | `qwen-audio-3.1-asr-flash-message` · `-streaming` · `qwen3-asr-flash-realtime` | WebSocket | `wss://{host}/api-ws/v1/inference`，支持边说边出字 |
-| `*-filetrans` | — | 只支持异步任务接口，**没实现**（选到会直接报错说明） |
+| `*-filetrans` | DashScope 异步 | `{base}/api/v1/services/audio/asr/transcription`：拿上传凭证 → OSS 表单上传 → `X-DashScope-Async` 建任务 → 轮询取结果，延迟高于同步模型 |
 
 形状由模型名自动决定；`api_style` 可强制。
 

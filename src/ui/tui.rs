@@ -324,10 +324,6 @@ fn apply_arg(app: &mut App, kind: ArgKind, name: &str) {
     };
     match kind {
         ArgKind::Model => {
-            if crate::asr::pick_style(name, None).is_err() {
-                toast_err(app, format!("{name} 不支持（异步 filetrans 没做）"));
-                return;
-            }
             cfg.model = name.to_string();
             cfg.api_style = None;
             if let Err(e) = crate::core::config::write(&crate::core::config::config_path(), &cfg) {
@@ -1019,8 +1015,8 @@ fn run_input(app: &mut App) -> Result<()> {
             } else {
                 match crate::core::config::load() {
                     Ok(mut cfg) => {
-                        if crate::asr::pick_style(&arg, None).is_err() {
-                            toast_err(app, format!("{arg} 不支持（异步 filetrans 没做）"));
+                        if arg.trim().is_empty() {
+                            toast_err(app, "模型名不能为空");
                         } else {
                             cfg.model = arg.clone();
                             cfg.api_style = None;

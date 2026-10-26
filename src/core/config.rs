@@ -31,7 +31,7 @@ pub struct Config {
     pub hotkey: String,
     /// 热键语义：`hold`（按住说话，默认）或 `toggle`（按一下开、再按一下停）。
     pub hotkey_mode: String,
-    /// 强制报文形状：`openai` / `dashscope` / `ws`；留空则按模型名推断。
+    /// 强制报文形状：`openai` / `dashscope` / `ws` / `filetrans`；留空则按模型名推断。
     pub api_style: Option<String>,
     /// 配色：`auto`（默认，问终端）/ `dark` / `light`。
     pub theme: Option<String>,
