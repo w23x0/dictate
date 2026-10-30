@@ -20,19 +20,20 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Clear, List, ListItem, ListState, Paragraph};
+use ratatui::widgets::{Block, BorderType, Clear, Paragraph};
 use ratatui::Terminal;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::core::config::Config;
 use crate::core::history::{Entry, History};
+use crate::ui::history_list::{HistoryList, GUTTER, ROW_PREFIX};
 use crate::ui::theme::Theme;
 
 const FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-/// 列表项前缀 "▌ 22:37  ❯ " 的显示宽度，折行的续行按它缩进。
-const LIST_PREFIX: usize = 11;
 /// 守护进程心跳超过这个毫秒数没有刷新，就当它死了（状态文件还留着 = 崩溃残留）。
 const DAEMON_STALE_MS: u64 = 6_000;
+/// 命令/参数面板一次最多显示几行。
+const PALETTE_ROWS: usize = 8;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Phase {
@@ -70,19 +71,25 @@ struct App {
     settings: Option<crate::ui::settings_ui::Form>,
     /// 底部命令行（grok-cli 的位置），`/` 开头是命令
     input: String,
+    /// `input` 的字节光标位置（永远落在字符边界）
+    input_cursor: usize,
     /// 命令面板里选中的条目
     palette_sel: usize,
     /// 标记的历史条目 id（`m` 切换；⏎ 时一起复制）
     marks: std::collections::HashSet<String>,
+    /// 标记变更计数：签名用它，避免「标记数没变但对象换了」导致 ✓ 残留
+    marks_rev: u64,
     toast: Option<Toast>,
     quit_requested: bool,
-    // ── 列表渲染缓存：条目文本折行按 (id, 宽度) 记住，列表项只在签名变化时重建，
-    //    100 ms 一帧不再对全部历史做 O(n) 的宽度计算与分配
+    // ── 列表渲染缓存：条目文本折行按 (id, 宽度) 记住，列表行只在签名变化时重建，
+    //    每帧只画视口内的行（history_list），100 ms 一帧不再对全部历史做 O(n) 分配
     wrap_cache: std::collections::HashMap<(String, usize), Vec<String>>,
-    list_items: Vec<ListItem<'static>>,
+    list_items: Vec<Line<'static>>,
     list_first_of: Vec<usize>,
     list_sig: String,
     list_at: Instant,
+    /// 列表视口第一行的行号（选中项会被自动滚进视口）
+    list_scroll: usize,
 }
 
 /// 斜杠命令：名字、参数提示、说明
@@ -130,8 +137,10 @@ impl App {
             overlay: None,
             settings: None,
             input: String::new(),
+            input_cursor: 0,
             palette_sel: 0,
             marks: std::collections::HashSet::new(),
+            marks_rev: 0,
             toast: None,
             quit_requested: false,
             wrap_cache: std::collections::HashMap::new(),
@@ -139,6 +148,7 @@ impl App {
             list_first_of: Vec::new(),
             list_sig: String::new(),
             list_at: Instant::now(),
+            list_scroll: 0,
         };
         app.reload();
         app
@@ -201,6 +211,177 @@ fn toast_err(app: &mut App, msg: impl Into<String>) {
     });
 }
 
+// ───────────────────────── 输入行编辑 ─────────────────────────
+//
+// 借 opentui 的 EditBuffer / rune 的 TextEdit：光标不是永远在末尾，
+// ←/→/Home/End/Delete/Ctrl+W 都能用，筛选和命令输入共用一套。
+
+fn prev_boundary(s: &str, mut i: usize) -> usize {
+    if i == 0 {
+        return 0;
+    }
+    i -= 1;
+    while i > 0 && !s.is_char_boundary(i) {
+        i -= 1;
+    }
+    i
+}
+
+fn next_boundary(s: &str, mut i: usize) -> usize {
+    if i >= s.len() {
+        return s.len();
+    }
+    i += 1;
+    while i < s.len() && !s.is_char_boundary(i) {
+        i += 1;
+    }
+    i
+}
+
+/// 输入变化后同步筛选状态：`/` 开头是命令，不拿去做历史过滤。
+fn input_sync(app: &mut App) {
+    app.palette_sel = 0;
+    if app.input.starts_with('/') {
+        app.query.clear();
+    } else {
+        app.query = app.input.clone();
+    }
+    app.refilter();
+}
+
+/// 整体替换输入（命令补全、清空等），光标放到末尾。
+fn set_input(app: &mut App, s: impl Into<String>) {
+    app.input = s.into();
+    app.input_cursor = app.input.len();
+    input_sync(app);
+}
+
+fn input_insert(app: &mut App, c: char) {
+    let at = app.input_cursor.min(app.input.len());
+    app.input.insert(at, c);
+    app.input_cursor = at + c.len_utf8();
+    input_sync(app);
+}
+
+fn input_backspace(app: &mut App) {
+    if app.input_cursor == 0 {
+        return;
+    }
+    let from = prev_boundary(&app.input, app.input_cursor.min(app.input.len()));
+    let to = app.input_cursor.min(app.input.len());
+    app.input.replace_range(from..to, "");
+    app.input_cursor = from;
+    input_sync(app);
+}
+
+fn input_delete(app: &mut App) {
+    let at = app.input_cursor.min(app.input.len());
+    if at >= app.input.len() {
+        return;
+    }
+    let to = next_boundary(&app.input, at);
+    app.input.replace_range(at..to, "");
+    input_sync(app);
+}
+
+fn input_left(app: &mut App) {
+    app.input_cursor = prev_boundary(&app.input, app.input_cursor.min(app.input.len()));
+}
+
+fn input_right(app: &mut App) {
+    app.input_cursor = next_boundary(&app.input, app.input_cursor.min(app.input.len()));
+}
+
+fn input_home(app: &mut App) {
+    app.input_cursor = 0;
+}
+
+fn input_end(app: &mut App) {
+    app.input_cursor = app.input.len();
+}
+
+/// Ctrl+W：删光标前一个词（先吞掉尾随空格，再删到空白）。
+fn input_kill_word(app: &mut App) {
+    let at = app.input_cursor.min(app.input.len());
+    let mut start = at;
+    while start > 0 {
+        let prev = prev_boundary(&app.input, start);
+        if app.input[prev..start].chars().all(char::is_whitespace) {
+            start = prev;
+        } else {
+            break;
+        }
+    }
+    while start > 0 {
+        let prev = prev_boundary(&app.input, start);
+        if app.input[prev..start].chars().all(char::is_whitespace) {
+            break;
+        }
+        start = prev;
+    }
+    if start != at {
+        app.input.replace_range(start..at, "");
+        app.input_cursor = start;
+        input_sync(app);
+    }
+}
+
+fn input_clear(app: &mut App) {
+    app.input.clear();
+    app.input_cursor = 0;
+    input_sync(app);
+}
+
+/// 光标前文本的显示宽度，用于把终端光标放到正确位置。
+fn display_width_before(s: &str, cursor: usize) -> usize {
+    UnicodeWidthStr::width(&s[..cursor.min(s.len())])
+}
+
+/// 输入行实际画出来的文本 + 光标列（`/key` 的密钥部分画成圆点）。
+fn input_display(app: &App) -> (String, usize) {
+    if let Some(secret) = app.input.strip_prefix("/key ") {
+        let cursor = app.input_cursor.min(app.input.len());
+        let before = if cursor <= 5 {
+            cursor
+        } else {
+            5 + app.input[5..cursor].chars().count()
+        };
+        (
+            format!("/key {}", "•".repeat(secret.chars().count())),
+            before,
+        )
+    } else {
+        (
+            app.input.clone(),
+            display_width_before(&app.input, app.input_cursor),
+        )
+    }
+}
+
+/// 输入比一行宽时，把左边滚出去，保证光标始终可见。
+fn fit_input(s: &str, cursor: usize, width: usize) -> (String, usize) {
+    if width == 0 {
+        return (String::new(), 0);
+    }
+    let cursor = cursor.min(s.len());
+    let before = UnicodeWidthStr::width(&s[..cursor]);
+    if before < width {
+        return (s.to_string(), before);
+    }
+    let mut start = cursor;
+    let mut w = 0usize;
+    while start > 0 {
+        let prev = prev_boundary(s, start);
+        let cw = UnicodeWidthStr::width(&s[prev..start]);
+        if w + cw >= width {
+            break;
+        }
+        w += cw;
+        start = prev;
+    }
+    (s[start..].to_string(), w)
+}
+
 // ───────────────────────── 命令面板 ─────────────────────────
 
 /// 输入处于「命令面板」状态：`/` 开头且还没敲参数（一敲空格就变成带参命令行）。
@@ -259,6 +440,16 @@ fn palette_hits(input: &str) -> Vec<(usize, Vec<usize>)> {
     }
     head.extend(tail);
     head
+}
+
+/// 面板里一次显示 `rows` 行时，视口第一行的下标：选中项尽量居中，
+/// 但不能越过末尾（否则选到第 9 条以后就看不见了）。
+fn window_start(sel: usize, len: usize, rows: usize) -> usize {
+    if len <= rows || rows == 0 {
+        0
+    } else {
+        sel.saturating_sub(rows / 2).min(len - rows)
+    }
 }
 
 /// 已带参数的命令行（"/model xxx"）底下那行提示用。
@@ -572,86 +763,188 @@ where
 }
 
 /// 把守护进程的状态文件映射成本地相位（用时间差还原已过去多久）。
-fn apply_status(app: &mut App) {
-    apply_status_from(&crate::core::config::status_path(), app);
-}
-
-fn apply_status_from(path: &std::path::Path, app: &mut App) {
+/// 返回 true 表示可见状态变了，调用方需要重画。
+fn apply_status_data(present: bool, st: Option<&StatusFile>, app: &mut App) -> bool {
     let now = crate::core::history::now_ms();
-    let Ok(body) = std::fs::read_to_string(path) else {
-        app.phase = Phase::Idle;
-        app.daemon_alive = false;
-        app.daemon_note = "守护进程没在跑 —— 先执行 dictate".into();
-        return;
+    let phase_key = |p: Phase| match p {
+        Phase::Idle => 0u8,
+        Phase::Recording(_) => 1,
+        Phase::Transcribing(_) => 2,
     };
-    let Ok(st) = serde_json::from_str::<StatusFile>(&body) else {
-        return;
-    };
-    // 心跳过期 = 进程崩了但状态文件残留：不再照着残留文件演「就绪/录音中」
-    if st.hb_ms > 0 && now.saturating_sub(st.hb_ms) > DAEMON_STALE_MS {
+    let old = (
+        app.daemon_alive,
+        phase_key(app.phase),
+        app.daemon_note.clone(),
+        app.partial.clone(),
+    );
+
+    if !present {
         app.phase = Phase::Idle;
         app.daemon_alive = false;
         app.partial.clear();
-        app.daemon_note = "守护进程没在响应 —— 重启：dictate run".into();
-        return;
+        app.daemon_note = "守护进程没在跑 —— 先执行 dictate".into();
+    } else if let Some(st) = st {
+        // 心跳过期 = 进程崩了但状态文件残留：不再照着残留文件演「就绪/录音中」
+        if st.hb_ms > 0 && now.saturating_sub(st.hb_ms) > DAEMON_STALE_MS {
+            app.phase = Phase::Idle;
+            app.daemon_alive = false;
+            app.partial.clear();
+            app.daemon_note = "守护进程没在响应 —— 重启：dictate run".into();
+        } else {
+            app.daemon_alive = true;
+            let elapsed = Duration::from_millis(now.saturating_sub(st.since_ms));
+            let at = Instant::now()
+                .checked_sub(elapsed)
+                .unwrap_or_else(Instant::now);
+            app.phase = match st.phase.as_str() {
+                "recording" => Phase::Recording(at),
+                "transcribing" => Phase::Transcribing(at),
+                _ => Phase::Idle,
+            };
+            app.partial = st.partial.clone().unwrap_or_default();
+            app.daemon_note = match (&st.error, &st.note, &st.text) {
+                (Some(e), _, _) => format!("失败：{e}"),
+                (None, Some(n), _) => n.clone(),
+                (None, None, Some(t)) => {
+                    format!("完成：{}", t.chars().take(40).collect::<String>())
+                }
+                (None, None, None) => String::new(),
+            };
+        }
     }
-    app.daemon_alive = true;
-    let elapsed = Duration::from_millis(now.saturating_sub(st.since_ms));
-    let at = Instant::now()
-        .checked_sub(elapsed)
-        .unwrap_or_else(Instant::now);
-    app.phase = match st.phase.as_str() {
-        "recording" => Phase::Recording(at),
-        "transcribing" => Phase::Transcribing(at),
-        _ => Phase::Idle,
-    };
-    app.partial = st.partial.clone().unwrap_or_default();
-    app.daemon_note = match (&st.error, &st.note, &st.text) {
-        (Some(e), _, _) => format!("失败：{e}"),
-        (None, Some(n), _) => n.clone(),
-        (None, None, Some(t)) => format!("完成：{}", t.chars().take(40).collect::<String>()),
-        (None, None, None) => String::new(),
-    };
+
+    old != (
+        app.daemon_alive,
+        phase_key(app.phase),
+        app.daemon_note.clone(),
+        app.partial.clone(),
+    )
+}
+
+#[cfg(test)]
+fn apply_status_from(path: &std::path::Path, app: &mut App) {
+    let body = std::fs::read_to_string(path).ok();
+    let st = body
+        .as_deref()
+        .and_then(|b| serde_json::from_str::<StatusFile>(b).ok());
+    let present = path.exists();
+    apply_status_data(present, st.as_ref(), app);
+}
+
+fn file_stamp(path: &std::path::Path) -> (u64, u64) {
+    std::fs::metadata(path)
+        .map(|m| {
+            use std::time::UNIX_EPOCH;
+            let t = m
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                .map(|d| d.as_nanos() as u64)
+                .unwrap_or(0);
+            (m.len(), t)
+        })
+        .unwrap_or((0, 0))
+}
+
+/// 状态文件只在 mtime/大小变化时重新读+解析；心跳过期仍每轮用缓存里的 hb_ms 判断。
+#[derive(Default)]
+struct StatusCache {
+    loaded: bool,
+    present: bool,
+    stamp: (u64, u64),
+    parsed: Option<StatusFile>,
+}
+
+impl StatusCache {
+    fn refresh(&mut self, path: &std::path::Path) -> bool {
+        let present = path.exists();
+        let stamp = file_stamp(path);
+        if !self.loaded || stamp != self.stamp || present != self.present {
+            self.loaded = true;
+            self.present = present;
+            self.stamp = stamp;
+            self.parsed = if present {
+                std::fs::read_to_string(path)
+                    .ok()
+                    .and_then(|b| serde_json::from_str(&b).ok())
+            } else {
+                None
+            };
+        }
+        self.present
+    }
+}
+
+fn toast_ttl(t: &Toast) -> Duration {
+    Duration::from_secs(if t.err { 8 } else { 5 })
 }
 
 /// 附着模式：只画，不抢热键/麦克风。
+///
+/// 借 rune 的「idle 不画」：没有状态变化、没有动画时不做 draw；
+/// 录音/转写才按 80 ms 出帧，普通空闲 250 ms 只 stat 一下文件。
 fn attach_loop(term: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> Result<()> {
-    let mut stamp = (0u64, 0u64);
+    let mut hist_stamp = (0u64, 0u64);
+    let mut status_cache = StatusCache::default();
+    let mut dirty = true;
+    let mut prev_toast = false;
     loop {
+        let mut changed = false;
         if let Some(form) = app.settings.as_mut() {
-            form.poll_test();
+            if form.poll_test() {
+                changed = true;
+            }
         }
-        apply_status(app);
-        let now = std::fs::metadata(crate::core::config::history_path())
-            .map(|m| {
-                use std::time::UNIX_EPOCH;
-                let t = m
-                    .modified()
-                    .ok()
-                    .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-                    .map(|d| d.as_nanos() as u64)
-                    .unwrap_or(0);
-                (m.len(), t)
-            })
-            .unwrap_or((0, 0));
-        if now != stamp {
-            stamp = now;
+        let present = status_cache.refresh(&crate::core::config::status_path());
+        if apply_status_data(present, status_cache.parsed.as_ref(), app) {
+            changed = true;
+        }
+        let now = file_stamp(&crate::core::config::history_path());
+        if now != hist_stamp {
+            hist_stamp = now;
             app.reload_keep_position();
+            changed = true;
         }
-        term.draw(|f| draw(f, app))?;
+        if changed {
+            dirty = true;
+        }
 
-        if !event::poll(Duration::from_millis(100))? {
-            continue;
+        let animating = matches!(app.phase, Phase::Recording(_) | Phase::Transcribing(_));
+        let toast_alive = app
+            .toast
+            .as_ref()
+            .map(|t| t.at.elapsed() < toast_ttl(t))
+            .unwrap_or(false);
+        if toast_alive != prev_toast {
+            prev_toast = toast_alive;
+            dirty = true;
         }
-        let Event::Key(k) = event::read()? else {
-            continue;
+        if dirty || animating {
+            term.draw(|f| draw(f, app))?;
+            dirty = false;
+        }
+
+        let testing = app.settings.as_ref().map(|f| f.testing()).unwrap_or(false);
+        let timeout = if animating {
+            Duration::from_millis(80)
+        } else if toast_alive || testing {
+            Duration::from_millis(150)
+        } else {
+            Duration::from_millis(250)
         };
-        if k.kind != KeyEventKind::Press {
+        if !event::poll(timeout)? {
             continue;
         }
-        match handle_key(app, &k)? {
-            Outcome::Continue => {}
-            Outcome::Quit => return Ok(()),
+        match event::read()? {
+            Event::Key(k) if k.kind == KeyEventKind::Press => {
+                dirty = true;
+                match handle_key(app, &k)? {
+                    Outcome::Continue => {}
+                    Outcome::Quit => return Ok(()),
+                }
+            }
+            Event::Resize(_, _) => dirty = true,
+            _ => {}
         }
     }
 }
@@ -766,6 +1059,22 @@ fn handle_key(app: &mut App, k: &crossterm::event::KeyEvent) -> Result<Outcome> 
     // Ctrl 系列与功能键
     match k.code {
         KeyCode::Char('c') if ctrl => return Ok(Outcome::Quit),
+        KeyCode::Char('a') if ctrl => {
+            input_home(app);
+            return Ok(Outcome::Continue);
+        }
+        KeyCode::Char('e') if ctrl => {
+            input_end(app);
+            return Ok(Outcome::Continue);
+        }
+        KeyCode::Char('w') if ctrl => {
+            input_kill_word(app);
+            return Ok(Outcome::Continue);
+        }
+        KeyCode::Char('u') if ctrl && !app.input.is_empty() => {
+            input_clear(app);
+            return Ok(Outcome::Continue);
+        }
         KeyCode::Char('d') if ctrl && app.input.is_empty() => {
             app.selected = (app.selected + 12).min(app.shown.len().saturating_sub(1));
             return Ok(Outcome::Continue);
@@ -776,7 +1085,7 @@ fn handle_key(app: &mut App, k: &crossterm::event::KeyEvent) -> Result<Outcome> 
         }
         KeyCode::Char('f') if ctrl => {
             if app.input.starts_with('/') {
-                app.input.clear();
+                input_clear(app);
             }
             toast(app, "直接输入文字即可过滤历史");
             return Ok(Outcome::Continue);
@@ -811,30 +1120,26 @@ fn handle_key(app: &mut App, k: &crossterm::event::KeyEvent) -> Result<Outcome> 
             if app.input.is_empty() {
                 return Ok(Outcome::Quit);
             }
-            app.input.clear();
-            app.query.clear();
-            app.palette_sel = 0;
-            app.refilter();
+            input_clear(app);
         }
         KeyCode::Enter => {
             if arg_active {
                 let (kind, h) = arg.unwrap();
                 let name = kind.items()[h[arg_sel]].0.to_string();
                 apply_arg(app, kind, &name);
-                app.input.clear();
+                input_clear(app);
             } else if palette {
                 // 面板里回车：无参命令直接执行，带参命令把名字填进去继续敲参数
                 let (ci, _) = hits[sel];
                 let (name, arg, _) = COMMANDS[ci];
                 if arg.is_empty() {
-                    app.input = name.to_string();
+                    set_input(app, name);
                     run_input(app)?;
                     if app.quit_requested {
                         return Ok(Outcome::Quit);
                     }
                 } else {
-                    app.input = format!("{name} ");
-                    app.palette_sel = 0;
+                    set_input(app, format!("{name} "));
                 }
             } else {
                 run_input(app)?;
@@ -843,16 +1148,9 @@ fn handle_key(app: &mut App, k: &crossterm::event::KeyEvent) -> Result<Outcome> 
                 }
             }
         }
-        KeyCode::Backspace => {
-            app.input.pop();
-            app.palette_sel = 0;
-            if app.input.starts_with('/') {
-                app.query.clear();
-            } else {
-                app.query = app.input.clone();
-            }
-            app.refilter();
-        }
+        KeyCode::Backspace => input_backspace(app),
+        KeyCode::Left => input_left(app),
+        KeyCode::Right => input_right(app),
         KeyCode::Up => {
             if arg_active {
                 app.palette_sel = arg_sel.saturating_sub(1);
@@ -876,23 +1174,29 @@ fn handle_key(app: &mut App, k: &crossterm::event::KeyEvent) -> Result<Outcome> 
         KeyCode::PageDown => {
             app.selected = (app.selected + 10).min(app.shown.len().saturating_sub(1));
         }
-        // 列表是倒序的：Home/g = 最新，End/G = 最旧
+        // 列表是倒序的：Home/g = 最新，End/G = 最旧；输入非空时先服务光标
+        KeyCode::Home if !app.input.is_empty() => input_home(app),
+        KeyCode::End if !app.input.is_empty() => input_end(app),
         KeyCode::Home => app.selected = 0,
         KeyCode::End => app.selected = app.shown.len().saturating_sub(1),
         KeyCode::Tab if arg_active => {
             let (kind, h) = arg.as_ref().unwrap();
             let name = kind.items()[h[arg_sel]].0;
-            app.input = format!("{} {name}", kind.cmd());
+            set_input(app, format!("{} {name}", kind.cmd()));
         }
         KeyCode::Tab if palette => {
             let (ci, _) = hits[sel];
             let (name, arg, _) = COMMANDS[ci];
-            app.input = if arg.is_empty() {
-                name.to_string()
-            } else {
-                format!("{name} ")
-            };
+            set_input(
+                app,
+                if arg.is_empty() {
+                    name.to_string()
+                } else {
+                    format!("{name} ")
+                },
+            );
         }
+        KeyCode::Delete if !app.input.is_empty() => input_delete(app),
         KeyCode::Delete => {
             if let Some(e) = app.current() {
                 let id = e.id.clone();
@@ -911,6 +1215,7 @@ fn handle_key(app: &mut App, k: &crossterm::event::KeyEvent) -> Result<Outcome> 
                 if !app.marks.remove(&id) {
                     app.marks.insert(id);
                 }
+                app.marks_rev = app.marks_rev.wrapping_add(1);
             }
         }
         KeyCode::Char('j') if app.input.is_empty() => {
@@ -923,17 +1228,7 @@ fn handle_key(app: &mut App, k: &crossterm::event::KeyEvent) -> Result<Outcome> 
         KeyCode::Char('G') if app.input.is_empty() => {
             app.selected = app.shown.len().saturating_sub(1)
         }
-        KeyCode::Char(c) if !ctrl => {
-            app.input.push(c);
-            app.palette_sel = 0;
-            // `/` 开头是命令，不拿去做过滤，否则打命令时列表会瞬间空掉
-            if app.input.starts_with('/') {
-                app.query.clear();
-            } else {
-                app.query = app.input.clone();
-            }
-            app.refilter();
-        }
+        KeyCode::Char(c) if !ctrl => input_insert(app, c),
         _ => {}
     }
     Ok(Outcome::Continue)
@@ -977,6 +1272,7 @@ fn run_input(app: &mut App) -> Result<()> {
         app.refilter();
         toast(app, format!("筛选：{line}（Esc 清除）"));
         app.input.clear();
+        app.input_cursor = 0;
         return Ok(());
     }
     // 命令不参与过滤
@@ -1099,6 +1395,7 @@ fn run_input(app: &mut App) -> Result<()> {
                     _ => {
                         toast_err(app, "用法：/theme auto|dark|light");
                         app.input.clear();
+                        app.input_cursor = 0;
                         return Ok(());
                     }
                 }
@@ -1174,11 +1471,13 @@ fn run_input(app: &mut App) -> Result<()> {
         }
         "/quit" => {
             app.input.clear();
+            app.input_cursor = 0;
             app.quit_requested = true;
         }
         other => toast_err(app, format!("没有这个命令：{other}（/help）")),
     }
     app.input.clear();
+    app.input_cursor = 0;
     Ok(())
 }
 
@@ -1200,23 +1499,6 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) {
         ])
         .split(area);
 
-    // ── 顶栏
-    let left = Line::from(vec![
-        Span::styled("◆ ", Style::default().fg(th.accent)),
-        Span::styled("dictate", Style::default().add_modifier(Modifier::BOLD)),
-        Span::styled(
-            format!("  v{}", env!("CARGO_PKG_VERSION")),
-            Style::default().fg(th.faint),
-        ),
-        Span::styled(
-            if app.subtitle.is_empty() {
-                String::new()
-            } else {
-                format!("  {}", app.subtitle)
-            },
-            Style::default().fg(th.dim),
-        ),
-    ]);
     // 界面不装样子：守护不在/上次失败都要从顶栏读出来，不能照旧亮绿灯「就绪」
     let (dot, mut dot_color, phase_text) = if !app.daemon_alive {
         ("○", th.faint, "无守护")
@@ -1240,6 +1522,8 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) {
     } else {
         format!("{}/{} 条 ", app.shown.len(), app.all.len())
     };
+
+    // ── 顶栏：右侧状态固定宽度，左侧品牌区按剩余宽度收缩（窄终端不挤掉状态）
     let right = Line::from(vec![
         Span::styled(dot, Style::default().fg(dot_color)),
         Span::styled(
@@ -1248,9 +1532,28 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) {
         ),
     ])
     .alignment(ratatui::layout::Alignment::Right);
+    let right_w = (right.width() as u16).min(chunks[0].width);
+    let left_w = chunks[0].width.saturating_sub(right_w + 1);
+    let mut left_spans = vec![
+        Span::styled("◆ ", Style::default().fg(th.accent)),
+        Span::styled("dictate", Style::default().add_modifier(Modifier::BOLD)),
+    ];
+    if left_w >= 22 {
+        left_spans.push(Span::styled(
+            format!("  v{}", env!("CARGO_PKG_VERSION")),
+            Style::default().fg(th.faint),
+        ));
+    }
+    if left_w >= 44 && !app.subtitle.is_empty() {
+        left_spans.push(Span::styled(
+            format!("  {}", app.subtitle),
+            Style::default().fg(th.dim),
+        ));
+    }
+    let left = Line::from(left_spans);
     let wide = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
+        .constraints([Constraint::Length(left_w), Constraint::Length(right_w)])
         .split(chunks[0]);
     f.render_widget(Paragraph::new(left), wide[0]);
     f.render_widget(Paragraph::new(right), wide[1]);
@@ -1296,10 +1599,11 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) {
     }
 
     // ── 历史列表：按天分组 + 自动折行。
-    //    列表项（含折行、分组头）只在签名变化或每满一分钟时重建——签名覆盖
-    //    条数/选中位/标记数/筛选词/配色；平时每帧只是把现成条目交给 ratatui
+    //    行内容只在签名变化或每满一分钟时重建——签名覆盖条数/标记版本/筛选词/配色/宽度；
+    //    选中态由 history_list 在渲染时叠加，所以 j/k 不再重建整表，每帧也只画视口。
     let list_area = chunks[2];
     if app.shown.is_empty() {
+        app.list_scroll = 0;
         let msg = if app.query.is_empty() {
             "还没有记录 —— 按住热键说一句，松开就会出现在这里"
         } else {
@@ -1312,12 +1616,11 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) {
         );
     } else {
         let sig = format!(
-            "{}|{}|{:?}|{}|{}|{}|{}|{}",
+            "{}|{}|{:?}|{}|{}|{}|{}",
             app.all.len(),
             app.shown.len(),
             app.shown.first(),
-            app.selected,
-            app.marks.len(),
+            app.marks_rev,
             app.query,
             app.theme.mode as u8,
             list_area.width,
@@ -1327,12 +1630,16 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) {
             app.list_sig = sig;
             app.list_at = Instant::now();
         }
-        let list = List::new(app.list_items.clone())
-            .highlight_style(Style::default().bg(th.selected_bg))
-            .highlight_symbol("");
-        let mut state = ListState::default();
-        state.select(app.list_first_of.get(app.selected).copied());
-        f.render_stateful_widget(list, list_area, &mut state);
+        f.render_widget(
+            HistoryList {
+                lines: &app.list_items,
+                first_of: &app.list_first_of,
+                selected: app.selected,
+                theme: th,
+                scroll: &mut app.list_scroll,
+            },
+            list_area,
+        );
     }
 
     // ── 流式字幕：录音中把中间文本顶在列表上方，边说边出字。
@@ -1388,28 +1695,21 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) {
         height: 1,
     };
 
+    let (display, cursor_col) = input_display(app);
+    let (display, cursor_col) =
+        fit_input(&display, cursor_col, inner.width.saturating_sub(2) as usize);
     let input_spans = if app.input.is_empty() {
         vec![
-            Span::styled("❯ ", Style::default().fg(th.accent)),
+            Span::styled("❯ ", Style::default().fg(th.focus)),
             Span::styled(
                 "输入过滤历史 · / 命令 · m 标记 · ⏎ 复制",
                 Style::default().fg(th.faint),
             ),
         ]
-    } else if let Some(secret) = app.input.strip_prefix("/key ") {
-        // key 不上屏：防止肩窥/截图泄露，只按字符数画圆点
-        vec![
-            Span::styled("❯ ", Style::default().fg(th.accent)),
-            Span::styled("/key ", Style::default().fg(Color::Reset)),
-            Span::styled(
-                "•".repeat(secret.chars().count()),
-                Style::default().fg(Color::Reset),
-            ),
-        ]
     } else {
         vec![
-            Span::styled("❯ ", Style::default().fg(th.accent)),
-            Span::styled(app.input.clone(), Style::default().fg(Color::Reset)),
+            Span::styled("❯ ", Style::default().fg(th.focus)),
+            Span::styled(display, Style::default().fg(Color::Reset)),
         ]
     };
     f.render_widget(
@@ -1417,12 +1717,10 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) {
         inner,
     );
     // 光标位置按「画出来的宽度」算：/key 打码后每个字符画成 1 格圆点
-    let w = if let Some(secret) = app.input.strip_prefix("/key ") {
-        5 + secret.chars().count() as u16
-    } else {
-        unicode_width::UnicodeWidthStr::width(app.input.as_str()) as u16
-    };
-    f.set_cursor_position(((inner.x + 2 + w).min(inner.x + inner.width - 1), inner.y));
+    f.set_cursor_position((
+        (inner.x + 2 + cursor_col as u16).min(inner.x + inner.width.saturating_sub(1)),
+        inner.y,
+    ));
 
     // ── 第二行：命令/参数面板提示 > toast > 相位
     let hits = palette_hits(&app.input);
@@ -1468,7 +1766,7 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) {
             ))
         }
     } else if let Some(t) = &app.toast {
-        let fresh = t.at.elapsed().as_secs() < if t.err { 8 } else { 5 };
+        let fresh = t.at.elapsed() < toast_ttl(t);
         if fresh {
             Line::from(Span::styled(
                 t.msg.clone(),
@@ -1497,9 +1795,11 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) {
         if !h.is_empty() {
             let sel = app.palette_sel.min(h.len() - 1);
             let items = kind.items();
+            let start = window_start(sel, h.len(), PALETTE_ROWS);
             let rows: Vec<Line> = h
                 .iter()
-                .take(8)
+                .skip(start)
+                .take(PALETTE_ROWS)
                 .enumerate()
                 .map(|(row, &i)| {
                     let (name, desc) = items[i];
@@ -1507,13 +1807,14 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) {
                         Span::styled(format!(" {name}  "), Style::default().fg(th.accent)),
                         Span::styled(desc.to_string(), Style::default().fg(th.dim)),
                     ]);
-                    if row == sel {
+                    if start + row == sel {
                         line = line.style(Style::default().bg(th.selected_bg));
                     }
                     line
                 })
                 .collect();
             let n = rows.len() as u16;
+            let title = format!(" {} {}/{} ", kind.title().trim(), sel + 1, h.len());
             render_float_box(
                 f,
                 th,
@@ -1523,13 +1824,14 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) {
                     width: 64.min(area.width.saturating_sub(4)),
                     height: n + 2,
                 },
-                kind.title(),
+                &title,
                 rows,
             );
         }
     } else if palette_query(&app.input).is_some() && !hits.is_empty() {
         let sel = app.palette_sel.min(hits.len() - 1);
-        let n = hits.len().min(8) as u16;
+        let start = window_start(sel, hits.len(), PALETTE_ROWS);
+        let n = hits.len().min(PALETTE_ROWS) as u16;
         let w = 64.min(area.width.saturating_sub(4));
         let rect = Rect {
             x: area.x + 2,
@@ -1539,7 +1841,8 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) {
         };
         let rows: Vec<Line> = hits
             .iter()
-            .take(8)
+            .skip(start)
+            .take(PALETTE_ROWS)
             .enumerate()
             .map(|(row, &(ci, ref hl))| {
                 let (name, arg, desc) = COMMANDS[ci];
@@ -1566,13 +1869,14 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) {
                     Style::default().fg(th.dim),
                 ));
                 let mut line = Line::from(spans);
-                if row == sel {
+                if start + row == sel {
                     line = line.style(Style::default().bg(th.selected_bg));
                 }
                 line
             })
             .collect();
-        render_float_box(f, th, rect, " 命令 ", rows);
+        let title = format!(" 命令 {}/{} ", sel + 1, hits.len());
+        render_float_box(f, th, rect, &title, rows);
     }
 
     if let Some(ov) = app.overlay {
@@ -1580,13 +1884,13 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) {
     }
 }
 
-/// 重建历史列表条目。折行结果按 (id, 宽度) 缓存——条目一旦落库就不变，
+/// 重建历史列表行。折行结果按 (id, 宽度) 缓存——条目一旦落库就不变，
 /// 所以只有首次（或宽度变化）才真正做宽度计算。
 fn rebuild_list(app: &mut App, width: u16) {
     let th = app.theme;
     let today = chrono::Local::now().date_naive();
     let yesterday = today.pred_opt().unwrap_or(today);
-    let body_w = (width.saturating_sub(LIST_PREFIX as u16 + 2)) as usize;
+    let body_w = (width.saturating_sub(GUTTER + ROW_PREFIX as u16 + 2)) as usize;
     // 缓存条数远超条目数（宽度来回变）时整体丢弃，防止无界增长
     if app.wrap_cache.len() > app.all.len() * 3 + 128 {
         app.wrap_cache.clear();
@@ -1598,11 +1902,11 @@ fn rebuild_list(app: &mut App, width: u16) {
         Raw(String),
     }
 
-    let mut items: Vec<ListItem> = Vec::with_capacity(app.shown.len() + 8);
+    let mut items: Vec<Line<'static>> = Vec::with_capacity(app.shown.len() + 8);
     let mut first_of: Vec<usize> = Vec::with_capacity(app.shown.len());
     let mut prev_key: Option<DayKey> = None;
 
-    for (pos, i) in app.shown.iter().enumerate() {
+    for i in app.shown.iter() {
         let e = &app.all[*i];
         let key = match entry_date(e) {
             Some(d) => DayKey::D(d),
@@ -1621,15 +1925,14 @@ fn rebuild_list(app: &mut App, width: u16) {
             let lw = UnicodeWidthStr::width(label.as_str());
             // 分隔线画满整行（宽终端下不再被 60 列截短）
             let fill = width.saturating_sub(lw as u16 + 4) as usize;
-            items.push(ListItem::new(Line::from(Span::styled(
+            items.push(Line::from(Span::styled(
                 format!(" {label} {}", "─".repeat(fill)),
                 Style::default().fg(th.faint),
-            ))));
+            )));
             prev_key = Some(key);
         }
         first_of.push(items.len());
 
-        let is_selected = pos == app.selected;
         let is_marked = app.marks.contains(&e.id);
         let time = e.ts.get(11..16).unwrap_or("--:--");
         let (body, color) = if e.is_ok() {
@@ -1645,23 +1948,18 @@ fn rebuild_list(app: &mut App, width: u16) {
             .entry((e.id.clone(), body_w))
             .or_insert_with(|| wrap_width(&body, body_w))
             .clone();
-        let last = lines.len() - 1;
+        let last = lines.len().saturating_sub(1);
         for (li, text) in lines.iter().enumerate() {
             let mut spans: Vec<Span> = Vec::new();
             if li == 0 {
-                // 首列只表达选中（▌）；标记 ✓ 没抢位置，挪到行尾——
-                // 选中态不能再只剩 16% 的底色差
-                spans.push(Span::styled(
-                    if is_selected { "▌" } else { " " }.to_string(),
-                    Style::default().fg(th.accent),
-                ));
+                // 左侧 gutter 由 history_list 画选中标记；这里只留内容前缀
                 spans.push(Span::styled(
                     format!(" {time}  "),
                     Style::default().fg(th.faint),
                 ));
                 spans.push(Span::styled("❯ ", Style::default().fg(th.accent)));
             } else {
-                spans.push(Span::raw(" ".repeat(LIST_PREFIX)));
+                spans.push(Span::raw(" ".repeat(ROW_PREFIX)));
             }
             spans.push(Span::styled(text.clone(), Style::default().fg(color)));
             if li == last {
@@ -1680,11 +1978,7 @@ fn rebuild_list(app: &mut App, width: u16) {
                     ));
                 }
             }
-            let mut line = Line::from(spans);
-            if is_selected {
-                line = line.style(Style::default().bg(th.selected_bg));
-            }
-            items.push(ListItem::new(line));
+            items.push(Line::from(spans));
         }
     }
 
@@ -1701,7 +1995,7 @@ fn render_float_box(f: &mut ratatui::Frame, th: Theme, rect: Rect, title: &str, 
                 .border_type(BorderType::Rounded)
                 .borders(ratatui::widgets::Borders::ALL)
                 .title(Span::styled(title, Style::default().fg(th.accent)))
-                .border_style(Style::default().fg(th.faint))
+                .border_style(Style::default().fg(th.border))
                 .style(Style::default().bg(th.panel_bg)),
         ),
         rect,
@@ -1822,7 +2116,7 @@ fn draw_overlay(f: &mut ratatui::Frame, app: &App, ov: Overlay) {
                     .border_type(BorderType::Rounded)
                     .borders(ratatui::widgets::Borders::ALL)
                     .title(Span::styled(title, Style::default().fg(th.accent)))
-                    .border_style(Style::default().fg(th.faint))
+                    .border_style(Style::default().fg(th.border))
                     .style(Style::default().bg(th.panel_bg)),
             ),
         rect,
@@ -2009,6 +2303,77 @@ mod tests {
             ),
             "2025-10-01"
         );
+    }
+
+    // ── 输入编辑（借 opentui EditBuffer / rune TextEdit 的光标语义）──
+
+    #[test]
+    fn fit_input_scrolls_to_keep_the_cursor_visible() {
+        // 宽字符按显示宽度算，滚动起点必须落在字符边界上
+        let (shown, col) = fit_input("abc中文def", "abc中文def".len(), 6);
+        assert_eq!(shown, "文def");
+        assert_eq!(col, 5);
+        // 光标在开头时不滚动
+        assert_eq!(fit_input("abcdef", 0, 3), ("abcdef".to_string(), 0));
+        // 宽度为 0 时不要 panic
+        assert_eq!(fit_input("abc", 1, 0), (String::new(), 0));
+    }
+
+    #[test]
+    fn input_editing_keeps_utf8_and_cursor_in_sync() {
+        let dir = std::env::temp_dir().join(format!("dictate-edit-{}", std::process::id()));
+        let mut app = app_with_entries(dir.to_str().unwrap());
+        set_input(&mut app, "ab中c");
+        input_left(&mut app); // c 前
+        input_backspace(&mut app); // 整个「中」一起删，不能切在 UTF-8 中间
+        assert_eq!(app.input, "abc");
+        assert_eq!(app.input_cursor, 2);
+
+        input_home(&mut app);
+        input_insert(&mut app, '你');
+        assert_eq!(app.input, "你abc");
+        assert_eq!(app.input_cursor, "你".len());
+
+        input_end(&mut app);
+        input_left(&mut app);
+        input_delete(&mut app); // 删掉光标后的 c
+        assert_eq!(app.input, "你ab");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn ctrl_w_kills_the_word_before_the_cursor() {
+        let dir = std::env::temp_dir().join(format!("dictate-kill-{}", std::process::id()));
+        let mut app = app_with_entries(dir.to_str().unwrap());
+        set_input(&mut app, "alpha beta  ");
+        input_kill_word(&mut app);
+        assert_eq!(app.input, "alpha ");
+        input_kill_word(&mut app);
+        assert_eq!(app.input, "");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn key_input_masks_every_secret_char_and_maps_cursor() {
+        let dir = std::env::temp_dir().join(format!("dictate-mask-{}", std::process::id()));
+        let mut app = app_with_entries(dir.to_str().unwrap());
+        set_input(&mut app, "/key sk-abc");
+        let (shown, col) = input_display(&app);
+        assert_eq!(shown, "/key ••••••");
+        assert_eq!(col, 5 + 6);
+        app.input_cursor = 7; // 两个 secret 字符之后
+        let (_, col) = input_display(&app);
+        assert_eq!(col, 7);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn palette_window_centers_selection_without_running_past_the_end() {
+        assert_eq!(window_start(0, 20, 8), 0);
+        assert_eq!(window_start(5, 20, 8), 1);
+        assert_eq!(window_start(19, 20, 8), 12);
+        assert_eq!(window_start(3, 5, 8), 0);
+        assert_eq!(window_start(3, 5, 0), 0);
     }
 
     // ── 按键逻辑 ──
@@ -2248,8 +2613,10 @@ mod tests {
             overlay: app.overlay,
             settings: None,
             input: input.to_string(),
+            input_cursor: input.len(),
             palette_sel: app.palette_sel,
             marks: app.marks.clone(),
+            marks_rev: app.marks_rev,
             toast: app.toast.clone(),
             quit_requested: false,
             wrap_cache: std::collections::HashMap::new(),
@@ -2257,6 +2624,7 @@ mod tests {
             list_first_of: Vec::new(),
             list_sig: String::new(),
             list_at: Instant::now(),
+            list_scroll: 0,
         };
         let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, h)).unwrap();
         term.draw(|f| draw(f, &mut a)).unwrap();
@@ -2358,6 +2726,21 @@ mod tests {
             lines[26].replace(' ', "").starts_with("❯"),
             "倒数第二行应是输入行"
         );
+    }
+
+    #[test]
+    fn narrow_header_keeps_status_and_drops_optional_text() {
+        let today = chrono::Local::now().date_naive();
+        let app = demo_app(today, "narrow");
+        let scr = render(&app, "", 30, 10);
+        let compact: String = scr.chars().filter(|c| !c.is_whitespace()).collect();
+        assert!(compact.contains("dictate"), "{scr}");
+        assert!(compact.contains("无守护"), "窄终端也要看见守护状态：{scr}");
+        assert!(
+            !compact.contains("qwen3-asr-flash"),
+            "窄终端应丢掉副标题：{scr}"
+        );
+        assert!(!compact.contains("v0.1.2"), "更窄时应先丢版本号：{scr}");
     }
 
     #[test]

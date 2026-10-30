@@ -82,6 +82,8 @@ pub struct Form {
     sel: usize,
     editing: bool,
     buf: String,
+    /// `buf` 的字节光标位置（编辑设置项时用）
+    buf_cursor: usize,
     status: String,
     dirty: bool,
     test: Option<Receiver<Result<(u64, String), String>>>,
@@ -103,6 +105,7 @@ impl Form {
             sel: 0,
             editing: false,
             buf: String::new(),
+            buf_cursor: 0,
             status: String::new(),
             dirty: false,
             test: None,
@@ -289,6 +292,7 @@ impl Form {
             10 => self.cfg.timeout_secs.to_string(),
             _ => String::new(),
         };
+        self.buf_cursor = self.buf.len();
     }
 
     fn commit_edit(&mut self) {
@@ -342,6 +346,7 @@ impl Form {
             Ok(()) => {
                 self.dirty = true;
                 self.editing = false;
+                self.buf_cursor = 0;
                 self.status = "已修改（自动保存）".into();
             }
             Err(e) => self.status = format!("没改：{e:#}"),
@@ -389,8 +394,8 @@ impl Form {
         });
     }
 
-    /// 收起测试结果（内嵌模式下由外层循环调用）。
-    pub fn poll_test(&mut self) {
+    /// 收起测试结果（内嵌模式下由外层循环调用）。返回 true = 收到结果。
+    pub fn poll_test(&mut self) -> bool {
         if let Some(rx) = &self.test {
             if let Ok(res) = rx.try_recv() {
                 self.status = match res {
@@ -398,8 +403,15 @@ impl Form {
                     Err(e) => format!("测试失败：{e}"),
                 };
                 self.test = None;
+                return true;
             }
         }
+        false
+    }
+
+    /// 测试线程还在跑（外层循环据此提高轮询频率）。
+    pub fn testing(&self) -> bool {
+        self.test.is_some()
     }
 
     fn run_test(&mut self) {
@@ -426,6 +438,53 @@ fn mask(key: &str) -> String {
     }
 }
 
+fn prev_boundary(s: &str, mut i: usize) -> usize {
+    if i == 0 {
+        return 0;
+    }
+    i -= 1;
+    while i > 0 && !s.is_char_boundary(i) {
+        i -= 1;
+    }
+    i
+}
+
+fn next_boundary(s: &str, mut i: usize) -> usize {
+    if i >= s.len() {
+        return s.len();
+    }
+    i += 1;
+    while i < s.len() && !s.is_char_boundary(i) {
+        i += 1;
+    }
+    i
+}
+
+/// 设置项编辑：Ctrl+W 删一个词，和主输入行一致。
+fn kill_word(buf: &mut String, cursor: &mut usize) {
+    let at = (*cursor).min(buf.len());
+    let mut start = at;
+    while start > 0 {
+        let prev = prev_boundary(buf, start);
+        if buf[prev..start].chars().all(char::is_whitespace) {
+            start = prev;
+        } else {
+            break;
+        }
+    }
+    while start > 0 {
+        let prev = prev_boundary(buf, start);
+        if buf[prev..start].chars().all(char::is_whitespace) {
+            break;
+        }
+        start = prev;
+    }
+    if start != at {
+        buf.replace_range(start..at, "");
+        *cursor = start;
+    }
+}
+
 pub fn run() -> Result<()> {
     let cfg = config::load()?;
     let mut form = Form::new(cfg);
@@ -444,15 +503,7 @@ pub fn run() -> Result<()> {
 
 fn event_loop(term: &mut Terminal<CrosstermBackend<std::io::Stdout>>, f: &mut Form) -> Result<()> {
     loop {
-        if let Some(rx) = &f.test {
-            if let Ok(res) = rx.try_recv() {
-                f.status = match res {
-                    Ok((ms, text)) => format!("测试通过（{ms} ms）：{text:?}"),
-                    Err(e) => format!("测试失败：{e}"),
-                };
-                f.test = None;
-            }
-        }
+        f.poll_test();
         term.draw(|fr| draw(fr, f))?;
         if !event::poll(std::time::Duration::from_millis(100))? {
             continue;
@@ -508,14 +559,51 @@ fn key(f: &mut Form, k: &crossterm::event::KeyEvent) -> Result<bool> {
         match k.code {
             KeyCode::Esc => {
                 f.editing = false;
+                f.buf_cursor = 0;
                 f.status = "已取消".into();
             }
             KeyCode::Enter => f.commit_edit(),
-            KeyCode::Char('u') if k.modifiers.contains(KeyModifiers::CONTROL) => f.buf.clear(),
-            KeyCode::Backspace => {
-                f.buf.pop();
+            KeyCode::Char('u') if k.modifiers.contains(KeyModifiers::CONTROL) => {
+                f.buf.clear();
+                f.buf_cursor = 0;
             }
-            KeyCode::Char(c) => f.buf.push(c),
+            KeyCode::Char('w') if k.modifiers.contains(KeyModifiers::CONTROL) => {
+                kill_word(&mut f.buf, &mut f.buf_cursor);
+            }
+            KeyCode::Char('a') if k.modifiers.contains(KeyModifiers::CONTROL) => {
+                f.buf_cursor = 0;
+            }
+            KeyCode::Char('e') if k.modifiers.contains(KeyModifiers::CONTROL) => {
+                f.buf_cursor = f.buf.len();
+            }
+            KeyCode::Left => {
+                f.buf_cursor = prev_boundary(&f.buf, f.buf_cursor.min(f.buf.len()));
+            }
+            KeyCode::Right => {
+                f.buf_cursor = next_boundary(&f.buf, f.buf_cursor.min(f.buf.len()));
+            }
+            KeyCode::Home => f.buf_cursor = 0,
+            KeyCode::End => f.buf_cursor = f.buf.len(),
+            KeyCode::Delete => {
+                let at = f.buf_cursor.min(f.buf.len());
+                if at < f.buf.len() {
+                    let to = next_boundary(&f.buf, at);
+                    f.buf.replace_range(at..to, "");
+                }
+            }
+            KeyCode::Backspace => {
+                if f.buf_cursor > 0 {
+                    let from = prev_boundary(&f.buf, f.buf_cursor.min(f.buf.len()));
+                    let to = f.buf_cursor.min(f.buf.len());
+                    f.buf.replace_range(from..to, "");
+                    f.buf_cursor = from;
+                }
+            }
+            KeyCode::Char(c) => {
+                let at = f.buf_cursor.min(f.buf.len());
+                f.buf.insert(at, c);
+                f.buf_cursor = at + c.len_utf8();
+            }
             _ => {}
         }
         return Ok(false);
@@ -623,7 +711,7 @@ fn draw(fr: &mut ratatui::Frame, f: &Form) {
                         format!(" {} ", p.title),
                         Style::default().fg(th.accent),
                     ))
-                    .border_style(Style::default().fg(th.faint))
+                    .border_style(Style::default().fg(th.border))
                     .style(Style::default().bg(th.panel_bg)),
             );
         fr.render_stateful_widget(list, rect, &mut state);
@@ -683,7 +771,12 @@ fn draw(fr: &mut ratatui::Frame, f: &Form) {
         .enumerate()
         .map(|(i, label)| {
             let value = if f.editing && i == f.sel {
-                format!("{}▏", f.buf)
+                // key 编辑时也打码：设置页同样可能被截图/肩窥
+                if i == 3 {
+                    "•".repeat(f.buf.chars().count())
+                } else {
+                    f.buf.clone()
+                }
             } else {
                 f.value(i)
             };
@@ -709,7 +802,12 @@ fn draw(fr: &mut ratatui::Frame, f: &Form) {
     // 光标藏起来的话 fcitx 只能瞎猜位置，于是候选框飘到屏幕外面。
     if f.editing {
         let row = chunks[2].y + f.sel as u16;
-        let prefix = 2 + 24 + unicode_width::UnicodeWidthStr::width(f.buf.as_str());
+        let before = if f.sel == 3 {
+            f.buf[..f.buf_cursor.min(f.buf.len())].chars().count()
+        } else {
+            UnicodeWidthStr::width(&f.buf[..f.buf_cursor.min(f.buf.len())])
+        };
+        let prefix = 2 + 24 + before;
         let max_x = chunks[2].x + chunks[2].width.saturating_sub(2);
         fr.set_cursor_position((max_x.min(chunks[2].x + prefix as u16), row));
     }
@@ -726,14 +824,16 @@ fn draw(fr: &mut ratatui::Frame, f: &Form) {
         width: panel.width.saturating_sub(4),
         height: 1,
     };
-    let status = if f.status.is_empty() {
+    let status = if f.editing && f.sel == 3 {
+        "API key 输入行已打码（只写本地配置，权限 600）".to_string()
+    } else if f.status.is_empty() {
         format!("配置文件：{}", config::config_path().display())
     } else {
         f.status.clone()
     };
     fr.render_widget(
         Paragraph::new(Line::from(vec![
-            Span::styled("❯ ", Style::default().fg(th.accent)),
+            Span::styled("❯ ", Style::default().fg(th.focus)),
             Span::styled(status, Style::default().fg(th.dim)),
         ]))
         .style(Style::default().bg(th.panel_bg)),
@@ -745,7 +845,7 @@ fn draw(fr: &mut ratatui::Frame, f: &Form) {
     };
     fr.render_widget(
         Paragraph::new(Line::from(Span::styled(
-            "↑↓ 选择   ⏎ 修改/选择   F2 或 s 保存   F3 测试   Esc 退出",
+            "↑↓ 选择   ⏎ 修改/选择   ←→ 光标   F2 或 s 保存   F3 测试   Esc 退出",
             Style::default().fg(th.faint),
         )))
         .alignment(ratatui::layout::Alignment::Right)
