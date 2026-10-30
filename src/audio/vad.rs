@@ -8,11 +8,12 @@ pub const FRAME_MS: u32 = 20;
 /// 语音帧判定阈值（dBFS）。低于它算静音。
 pub const SPEECH_DBFS: f32 = -45.0;
 
-/// 裁掉首尾静音，两端各留 `pad_ms` 余量。全是静音时返回空切片。
-pub fn trim_silence(samples: &[f32], rate: u32, pad_ms: u32) -> &[f32] {
+/// 裁掉首尾静音，两端各留 `pad_ms` 余量。全是静音时返回 `None`。
+pub fn trim_range(samples: &[f32], rate: u32, pad_ms: u32) -> Option<(usize, usize)> {
     let frame = ((rate as f32 * FRAME_MS as f32) / 1000.0) as usize;
     if frame == 0 || samples.len() < frame {
-        return samples;
+        // 短于一个帧（或退化率）：不裁，按有语音处理
+        return Some((0, samples.len()));
     }
     let frames = samples.len() / frame;
     let mut first = None;
@@ -24,13 +25,28 @@ pub fn trim_silence(samples: &[f32], rate: u32, pad_ms: u32) -> &[f32] {
             last = Some(f);
         }
     }
-    let (Some(a), Some(b)) = (first, last) else {
-        return &samples[0..0];
-    };
+    let (a, b) = (first?, last?);
     let pad = ((rate as f32 * pad_ms as f32) / 1000.0) as usize;
     let start = (a * frame).saturating_sub(pad);
     let end = (((b + 1) * frame) + pad).min(samples.len());
-    &samples[start..end]
+    Some((start, end))
+}
+
+/// 原地裁掉首尾静音（两端各留 `pad_ms` 余量）；全是静音则清空返回 `false`。
+/// 有语音时用 `copy_within` 原地收缩 buffer，不额外分配。
+pub fn trim_in_place(buf: &mut Vec<f32>, rate: u32, pad_ms: u32) -> bool {
+    if buf.is_empty() {
+        return false;
+    }
+    let Some((start, end)) = trim_range(buf, rate, pad_ms) else {
+        buf.clear();
+        return false;
+    };
+    if start > 0 {
+        buf.copy_within(start..end, 0);
+    }
+    buf.truncate(end - start);
+    true
 }
 
 /// 从尾部往回看：末尾连续静音是否已经 ≥ `silence_ms`。
@@ -69,7 +85,8 @@ mod tests {
         let mut v = vec![0.0f32; rate as usize / 2]; // 0.5 s 静音
         v.extend(tone(0.5, rate));
         v.extend(vec![0.0f32; rate as usize / 2]);
-        let t = trim_silence(&v, rate, 0);
+        let (s, e) = trim_range(&v, rate, 0).unwrap();
+        let t = &v[s..e];
         let dur = t.len() as f32 / rate as f32;
         assert!((dur - 0.5).abs() < 0.06, "dur={dur}");
     }
@@ -78,7 +95,24 @@ mod tests {
     fn all_silence_yields_empty() {
         let rate = 16_000;
         let v = vec![0.0f32; rate as usize];
-        assert!(trim_silence(&v, rate, 0).is_empty());
+        assert!(trim_range(&v, rate, 0).is_none());
+    }
+
+    #[test]
+    fn trim_in_place_shrinks_and_preserves_samples() {
+        let rate = 16_000;
+        let mut v = vec![0.0f32; rate as usize / 2];
+        v.extend(tone(0.5, rate));
+        v.extend(vec![0.0f32; rate as usize / 2]);
+        let cap = v.capacity();
+        assert!(trim_in_place(&mut v, rate, 0));
+        let dur = v.len() as f32 / rate as f32;
+        assert!((dur - 0.5).abs() < 0.06, "dur={dur}");
+        // 内容没被破坏：去掉首尾静音后，中间那段正弦仍在
+        let expected = tone(0.5, rate);
+        assert_eq!(v, expected);
+        // 原地裁剪不该重新分配
+        assert_eq!(v.capacity(), cap);
     }
 
     #[test]

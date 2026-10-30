@@ -28,21 +28,23 @@ pub fn prepare_wav(cfg: &Config, pcm: &[f32], rate: u32) -> Result<Vec<u8>> {
     agc.process(&mut processed);
 
     let peak = crate::audio::agc::lin_to_db(processed.iter().fold(0.0f32, |m, s| m.max(s.abs())));
-    let trimmed = crate::audio::vad::trim_silence(&processed, audio::TARGET_RATE, 100).to_vec();
-    if trimmed.is_empty() {
+    // 原地裁静音：有语音才收缩（copy_within + truncate，不额外分配），
+    // 避免再来一份 `.to_vec()` 大的拷贝
+    let was_speech = crate::audio::vad::trim_in_place(&mut processed, audio::TARGET_RATE, 100);
+    if !was_speech {
         bail!(
             "没有检测到语音：峰值 {peak:.0} dBFS，低于门限 {:.0} dBFS。             检查麦克风（`dictate probe --seconds 3` 看电平，或用 `dictate devices` 换设备）",
             crate::audio::vad::SPEECH_DBFS
         );
     }
-    let secs = trimmed.len() as f32 / audio::TARGET_RATE as f32;
+    let secs = processed.len() as f32 / audio::TARGET_RATE as f32;
     if secs > cfg.max_seconds {
         bail!(
             "录音 {secs:.1} 秒超过上限 {:.0} 秒（服务端 10 MB / 5 分钟硬限）",
             cfg.max_seconds
         );
     }
-    let voiced = trimmed;
+    let voiced = processed;
 
     if cfg.keep_audio {
         let keep = crate::core::config::status_path()

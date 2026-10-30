@@ -252,15 +252,27 @@ pub fn record_until(
 
     stream.play()?;
     let started = std::time::Instant::now();
+    // 只复制尾部窗口来判静音：判定「尾巴是否安静够久」不需要整段录音，
+    // 也避免拿着采集锁做 O(n) 扫描阻塞音频回调。窗口多留一帧，保证
+    // 尾部的语音不会因为帧边界被漏掉。
+    let tail_ms = silence_ms.saturating_add(crate::audio::vad::FRAME_MS);
+    let tail_len = (rate as u64 * tail_ms as u64 / 1000) as usize;
+    let mut vad_tail: Vec<f32> = Vec::new();
     loop {
         std::thread::sleep(std::time::Duration::from_millis(50));
         if started.elapsed().as_secs_f32() >= max_seconds {
             break;
         }
         if silence_ms > 0 {
-            let snap = buf.lock().unwrap().clone();
-            let total_ms = (snap.len() as f32 / rate as f32 * 1000.0) as u32;
-            let quiet = crate::audio::vad::trailing_silence_ms(&snap, rate);
+            let total_ms;
+            {
+                let snap = buf.lock().unwrap();
+                total_ms = (snap.len() as f32 / rate as f32 * 1000.0) as u32;
+                let start = snap.len().saturating_sub(tail_len);
+                vad_tail.clear();
+                vad_tail.extend_from_slice(&snap[start..]);
+            }
+            let quiet = crate::audio::vad::trailing_silence_ms(&vad_tail, rate);
             // 出现过语音（总长 > 静音尾巴）且尾巴够长 → 收工
             if quiet >= silence_ms && total_ms > quiet {
                 break;

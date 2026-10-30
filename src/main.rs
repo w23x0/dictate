@@ -238,8 +238,10 @@ fn cmd_probe(args: &[String]) -> Result<()> {
             "  `dictate devices` 看有哪些输入；`pactl info | grep 'Default Source'` 看系统默认源。"
         );
     }
-    let trimmed = audio::vad::trim_silence(&pcm, audio::TARGET_RATE, 100);
-    let mut voiced = trimmed.to_vec();
+    let full_len = pcm.len();
+    // 原地裁静音：有语音才收缩，全静音则清空（短 buffer 时不裁，等价于原样）
+    audio::vad::trim_in_place(&mut pcm, audio::TARGET_RATE, 100);
+    let mut voiced = std::mem::take(&mut pcm);
     let mut agc = Agc::new(
         audio::TARGET_RATE,
         AgcConfig {
@@ -252,8 +254,8 @@ fn cmd_probe(args: &[String]) -> Result<()> {
 
     println!(
         "16 kHz 后：{} 样本（{:.2} s），RMS {before:.1} / 峰值 {peak_in:.1} dBFS，语音段 {} 样本，AGC 后 {after:.1} dBFS（增益 ×{gain:.2}）",
-        pcm.len(),
-        pcm.len() as f32 / audio::TARGET_RATE as f32,
+        full_len,
+        full_len as f32 / audio::TARGET_RATE as f32,
         voiced.len()
     );
 
